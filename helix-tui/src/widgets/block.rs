@@ -47,7 +47,7 @@ impl Default for BorderType {
 ///     .border_type(BorderType::Rounded)
 ///     .style(Style::default().bg(Color::Black));
 /// ```
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Block<'a> {
     /// Optional title place on the upper left of the block
     title: Option<Spans<'a>>,
@@ -60,6 +60,18 @@ pub struct Block<'a> {
     border_type: BorderType,
     /// Widget style
     style: Style,
+}
+
+impl<'a> Default for Block<'a> {
+    fn default() -> Block<'a> {
+        Block {
+            title: None,
+            borders: Default::default(),
+            border_style: Default::default(),
+            border_type: BorderType::Rounded,
+            style: Default::default(),
+        }
+    }
 }
 
 impl<'a> Block<'a> {
