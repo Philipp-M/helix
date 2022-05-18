@@ -96,11 +96,12 @@ pub fn lang_features() -> Result<String, DynError> {
             );
         }
         row.push(
-            lc.language_server
-                .as_ref()
+            lc.language_servers
+                .iter()
                 .map(|s| s.command.clone())
                 .map(|c| md_mono(&c))
-                .unwrap_or_default(),
+                .collect::<Vec<_>>()
+                .join(", "),
         );
 
         md.push_str(&md_table_row(&row));

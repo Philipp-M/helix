@@ -236,7 +236,8 @@ impl Completion {
         doc: &Document,
         completion_item: lsp::CompletionItem,
     ) -> Option<CompletionItem> {
-        let language_server = doc.language_server()?;
+        // TODO support multiple language servers instead of taking the first language server
+        let language_server = doc.language_servers().first().map(|l| *l)?;
         let completion_resolve_provider = language_server
             .capabilities()
             .completion_provider

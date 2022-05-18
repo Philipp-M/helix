@@ -867,47 +867,54 @@ impl Editor {
     }
 
     /// Refreshes the language server for a given document
-    pub fn refresh_language_server(&mut self, doc_id: DocumentId) -> Option<()> {
+    pub fn refresh_language_servers(&mut self, doc_id: DocumentId) -> Option<()> {
         let doc = self.documents.get_mut(&doc_id)?;
-        Self::launch_language_server(&mut self.language_servers, doc)
+        Self::launch_language_servers(&mut self.language_servers, doc)
     }
 
     /// Launch a language server for a given document
-    fn launch_language_server(ls: &mut helix_lsp::Registry, doc: &mut Document) -> Option<()> {
+    fn launch_language_servers(ls: &mut helix_lsp::Registry, doc: &mut Document) -> Option<()> {
         // if doc doesn't have a URL it's a scratch buffer, ignore it
         let doc_url = doc.url()?;
 
-        // try to find a language server based on the language name
-        let language_server = doc.language.as_ref().and_then(|language| {
+        // try to find a language servers based on the language name
+        let language_servers = doc.language.as_ref().and_then(|language| {
             ls.get(language, doc.path())
                 .map_err(|e| {
                     log::error!(
-                        "Failed to initialize the LSP for `{}` {{ {} }}",
+                        "Failed to initialize the language servers for `{}` {{ {} }}",
                         language.scope(),
                         e
                     )
                 })
                 .ok()
-                .flatten()
         });
-        if let Some(language_server) = language_server {
-            // only spawn a new lang server if the servers aren't the same
-            if Some(language_server.id()) != doc.language_server().map(|server| server.id()) {
-                if let Some(language_server) = doc.language_server() {
-                    tokio::spawn(language_server.text_document_did_close(doc.identifier()));
+        if let Some(language_servers) = language_servers {
+            // only spawn new lang servers if the servers aren't the same
+            let doc_language_servers = doc.language_servers();
+            let spawn_new_servers = language_servers.len() != doc_language_servers.len()
+                || language_servers
+                    .iter()
+                    .zip(doc_language_servers.iter())
+                    .any(|(l, dl)| l.id() != dl.id());
+            if spawn_new_servers {
+                for doc_language_server in doc_language_servers {
+                    tokio::spawn(doc_language_server.text_document_did_close(doc.identifier()));
                 }
 
                 let language_id = doc.language_id().map(ToOwned::to_owned).unwrap_or_default();
 
-                // TODO: this now races with on_init code if the init happens too quickly
-                tokio::spawn(language_server.text_document_did_open(
-                    doc_url,
-                    doc.version(),
-                    doc.text(),
-                    language_id,
-                ));
+                for language_server in &language_servers {
+                    // TODO: this now races with on_init code if the init happens too quickly
+                    tokio::spawn(language_server.text_document_did_open(
+                        doc_url.clone(),
+                        doc.version(),
+                        doc.text(),
+                        language_id.clone(),
+                    ));
+                }
 
-                doc.set_language_server(Some(language_server));
+                doc.set_language_servers(language_servers);
             }
         }
         Some(())
@@ -1062,7 +1069,7 @@ impl Editor {
         } else {
             let mut doc = Document::open(&path, None, Some(self.syn_loader.clone()))?;
 
-            let _ = Self::launch_language_server(&mut self.language_servers, &mut doc);
+            let _ = Self::launch_language_servers(&mut self.language_servers, &mut doc);
 
             self.new_document(doc)
         };
@@ -1089,7 +1096,7 @@ impl Editor {
             return Err(CloseError::BufferModified(doc.display_name().into_owned()));
         }
 
-        if let Some(language_server) = doc.language_server() {
+        for language_server in doc.language_servers() {
             tokio::spawn(language_server.text_document_did_close(doc.identifier()));
         }
 

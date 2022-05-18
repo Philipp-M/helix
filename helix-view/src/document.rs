@@ -120,7 +120,7 @@ pub struct Document {
     pub(crate) modified_since_accessed: bool,
 
     diagnostics: Vec<Diagnostic>,
-    language_server: Option<Arc<helix_lsp::Client>>,
+    language_servers: Vec<Arc<helix_lsp::Client>>,
 }
 
 use std::{fmt, mem};
@@ -358,7 +358,7 @@ impl Document {
             savepoint: None,
             last_saved_revision: 0,
             modified_since_accessed: false,
-            language_server: None,
+            language_servers: Vec::new(),
         }
     }
 
@@ -464,19 +464,22 @@ impl Document {
             return Some(formatting_future.boxed());
         };
 
-        let language_server = self.language_server()?;
         let text = self.text.clone();
-        let offset_encoding = language_server.offset_encoding();
-
-        let request = language_server.text_document_formatting(
-            self.identifier(),
-            lsp::FormattingOptions {
-                tab_size: self.tab_width() as u32,
-                insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
-                ..Default::default()
-            },
-            None,
-        )?;
+        // finds first language server that supports formatting and then formats
+        let (offset_encoding, request) =
+            self.language_servers().iter().find_map(|language_server| {
+                let offset_encoding = language_server.offset_encoding();
+                let request = language_server.text_document_formatting(
+                    self.identifier(),
+                    lsp::FormattingOptions {
+                        tab_size: self.tab_width() as u32,
+                        insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
+                        ..Default::default()
+                    },
+                    None,
+                )?;
+                Some((offset_encoding, request))
+            })?;
 
         let fut = async move {
             let edits = request.await.unwrap_or_else(|e| {
@@ -522,7 +525,7 @@ impl Document {
         let path = self.path.clone().expect("Can't save with no path set!");
         let identifier = self.identifier();
 
-        let language_server = self.language_server.clone();
+        let language_servers = self.language_servers.clone();
 
         // mark changes up to now as saved
         self.reset_modified();
@@ -563,12 +566,12 @@ impl Document {
             let mut file = File::create(path).await?;
             to_writer(&mut file, encoding, &text).await?;
 
-            if let Some(language_server) = language_server {
+            for language_server in language_servers {
                 if !language_server.is_initialized() {
                     return Ok(());
                 }
                 if let Some(notification) =
-                    language_server.text_document_did_save(identifier, &text)
+                    language_server.text_document_did_save(identifier.clone(), &text)
                 {
                     notification.await?;
                 }
@@ -693,8 +696,8 @@ impl Document {
     }
 
     /// Set the LSP.
-    pub fn set_language_server(&mut self, language_server: Option<Arc<helix_lsp::Client>>) {
-        self.language_server = language_server;
+    pub fn set_language_servers(&mut self, language_servers: Vec<Arc<helix_lsp::Client>>) {
+        self.language_servers = language_servers;
     }
 
     /// Select text within the [`Document`].
@@ -793,7 +796,7 @@ impl Document {
                 .sort_unstable_by_key(|diagnostic| diagnostic.range);
 
             // emit lsp notification
-            if let Some(language_server) = self.language_server() {
+            for language_server in self.language_servers() {
                 let notify = language_server.text_document_did_change(
                     self.versioned_identifier(),
                     &old_doc,
@@ -957,17 +960,15 @@ impl Document {
     }
 
     /// Language ID for the document. Either the `language-id` from the
-    /// `language-server` configuration, or the document language if no
+    /// first `language-server` configuration, or the document language if no
     /// `language-id` has been specified.
     pub fn language_id(&self) -> Option<&str> {
-        let language_config = self.language.as_deref()?;
-
-        language_config
-            .language_server
-            .as_ref()?
-            .language_id
-            .as_deref()
-            .or(Some(language_config.language_id.as_str()))
+        // TODO is it safe to get the language_id from the first language server that defines it?
+        self.language_config()?
+            .language_servers
+            .iter()
+            .find_map(|lsp_config| lsp_config.language_id.as_deref())
+            .or_else(|| self.language_name())
     }
 
     /// Corresponding [`LanguageConfiguration`].
@@ -981,9 +982,11 @@ impl Document {
     }
 
     /// Language server if it has been initialized.
-    pub fn language_server(&self) -> Option<&helix_lsp::Client> {
-        let server = self.language_server.as_deref()?;
-        server.is_initialized().then(|| server)
+    pub fn language_servers(&self) -> Vec<&helix_lsp::Client> {
+        self.language_servers
+            .iter()
+            .filter_map(|l| if l.is_initialized() { Some(&**l) } else { None })
+            .collect()
     }
 
     #[inline]

@@ -183,15 +183,16 @@ where
     );
 }
 
+// TODO think about handling multiple language servers
 fn render_lsp_spinner<F>(context: &mut RenderContext, write: F)
 where
     F: Fn(&mut RenderContext, String, Option<Style>) + Copy,
 {
+    let language_servers = context.doc.language_servers();
     write(
         context,
-        context
-            .doc
-            .language_server()
+        language_servers
+            .first()
             .and_then(|srv| {
                 context
                     .spinners

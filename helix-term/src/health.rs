@@ -178,10 +178,8 @@ pub fn languages_all() -> std::io::Result<()> {
     for lang in &syn_loader_conf.language {
         column(&lang.language_id, Color::Reset);
 
-        let lsp = lang
-            .language_server
-            .as_ref()
-            .map(|lsp| lsp.command.to_string());
+        // TODO multiple language servers
+        let lsp = lang.language_servers.first().map(|lsp| lsp.command.clone());
         check_binary(lsp);
 
         let dap = lang.debugger.as_ref().map(|dap| dap.command.to_string());
@@ -250,11 +248,10 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
         }
     };
 
+    // TODO multiple language servers
     probe_protocol(
         "language server",
-        lang.language_server
-            .as_ref()
-            .map(|lsp| lsp.command.to_string()),
+        lang.language_servers.first().map(|lsp| lsp.command.clone()),
     )?;
 
     probe_protocol(

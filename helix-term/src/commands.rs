@@ -2914,23 +2914,22 @@ pub mod insert {
         use helix_lsp::lsp;
         // if ch matches completion char, trigger completion
         let doc = doc_mut!(cx.editor);
-        let language_server = match doc.language_server() {
-            Some(language_server) => language_server,
-            None => return,
-        };
+        let trigger_completion = doc.language_servers().iter().any(|language_server| {
+            let capabilities = language_server.capabilities();
 
-        let capabilities = language_server.capabilities();
-
-        if let Some(lsp::CompletionOptions {
-            trigger_characters: Some(triggers),
-            ..
-        }) = &capabilities.completion_provider
-        {
             // TODO: what if trigger is multiple chars long
-            if triggers.iter().any(|trigger| trigger.contains(ch)) {
-                cx.editor.clear_idle_timer();
-                super::completion(cx);
+            match &capabilities.completion_provider {
+                Some(lsp::CompletionOptions {
+                    trigger_characters: Some(triggers),
+                    ..
+                }) => triggers.iter().any(|trigger| trigger.contains(ch)),
+                _ => false,
             }
+        });
+
+        if trigger_completion {
+            cx.editor.clear_idle_timer();
+            super::completion(cx);
         }
     }
 
@@ -2941,33 +2940,33 @@ pub mod insert {
         // The language_server!() macro is not used here since it will
         // print an "LSP not active for current buffer" message on
         // every keypress.
-        let language_server = match doc.language_server() {
-            Some(language_server) => language_server,
-            None => return,
-        };
+        let is_trigger = doc.language_servers().iter().any(|language_server| {
+            let capabilities = language_server.capabilities();
 
-        let capabilities = language_server.capabilities();
-
-        if let lsp::ServerCapabilities {
-            signature_help_provider:
-                Some(lsp::SignatureHelpOptions {
-                    trigger_characters: Some(triggers),
-                    // TODO: retrigger_characters
+            match capabilities {
+                lsp::ServerCapabilities {
+                    signature_help_provider:
+                        Some(lsp::SignatureHelpOptions {
+                            trigger_characters: Some(triggers),
+                            // TODO: retrigger_characters
+                            ..
+                        }),
                     ..
-                }),
-            ..
-        } = capabilities
-        {
-            // TODO: what if trigger is multiple chars long
-            let is_trigger = triggers.iter().any(|trigger| trigger.contains(ch));
-            // lsp doesn't tell us when to close the signature help, so we request
-            // the help information again after common close triggers which should
-            // return None, which in turn closes the popup.
-            let close_triggers = &[')', ';', '.'];
-
-            if is_trigger || close_triggers.contains(&ch) {
-                super::signature_help_impl(cx, SignatureHelpInvoked::Automatic);
+                } => {
+                    // TODO: what if trigger is multiple chars long
+                    let is_trigger = triggers.iter().any(|trigger| trigger.contains(ch));
+                    // lsp doesn't tell us when to close the signature help, so we request
+                    // the help information again after common close triggers which should
+                    // return None, which in turn closes the popup.
+                    let close_triggers = &[')', ';', '.'];
+                    is_trigger || close_triggers.contains(&ch)
+                }
+                _ => false,
             }
+        });
+
+        if is_trigger {
+            super::signature_help(cx);
         }
     }
 
@@ -3700,8 +3699,8 @@ fn format_selections(cx: &mut Context) {
     // via lsp if available
     // else via tree-sitter indentation calculations
 
-    let language_server = match doc.language_server() {
-        Some(language_server) => language_server,
+    let language_server = match doc.language_servers().first() {
+        Some(language_server) => *language_server,
         None => return,
     };
 
@@ -3714,10 +3713,6 @@ fn format_selections(cx: &mut Context) {
     // TODO: all of the TODO's and commented code inside the loop,
     // to make this actually work.
     for _range in ranges {
-        let _language_server = match doc.language_server() {
-            Some(language_server) => language_server,
-            None => return,
-        };
         // TODO: handle fails
         // TODO: concurrent map
 
@@ -3862,8 +3857,10 @@ pub fn completion(cx: &mut Context) {
 
     let (view, doc) = current!(cx.editor);
 
-    let language_server = match doc.language_server() {
-        Some(language_server) => language_server,
+    // TODO merge completion items of multiple language servers,
+    // instead of taking the first language server for completion
+    let language_server = match doc.language_servers().first() {
+        Some(language_server) => *language_server,
         None => return,
     };
 

@@ -9,7 +9,7 @@ file-types = ["rs"]
 roots = ["Cargo.toml", "Cargo.lock"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "rust-analyzer" }
+language-servers = [{ command = "rust-analyzer" }]
 indent = { tab-width = 4, unit = "    " }
 
 [language.auto-pairs]
@@ -59,7 +59,7 @@ injection-regex = "toml"
 file-types = ["toml"]
 roots = []
 comment-token = "#"
-language-server = { command = "taplo", args = ["lsp", "stdio"] }
+language-servers = [{ command = "taplo", args = ["lsp", "stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -73,7 +73,7 @@ injection-regex = "awk"
 file-types = ["awk", "gawk", "nawk", "mawk"]
 roots = []
 comment-token = "#"
-language-server = { command = "awk-language-server" }
+language-servers = [{ command = "awk-language-server" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -101,8 +101,7 @@ file-types = ["ex", "exs", "mix.lock"]
 shebangs = ["elixir"]
 roots = ["mix.exs", "mix.lock"]
 comment-token = "#"
-language-server = { command = "elixir-ls" }
-config = { elixirLS.dialyzerEnabled = false }
+language-servers = [{ command = "elixir-ls", config = { elixirLS.dialyzerEnabled = false } }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -131,7 +130,7 @@ file-types = ["mint"]
 shebangs = []
 roots = []
 comment-token = "//"
-language-server = { command = "mint", args = ["ls"] }
+language-servers = [{ command = "mint", args = ["ls"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[language]]
@@ -140,9 +139,8 @@ scope = "source.json"
 injection-regex = "json"
 file-types = ["json"]
 roots = []
-language-server = { command = "vscode-json-language-server", args = ["--stdio"] }
+language-servers = [{ command = "vscode-json-language-server", args = ["--stdio"], config = { "provideFormatter" = true } }]
 auto-format = true
-config = { "provideFormatter" = true }
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -156,7 +154,7 @@ injection-regex = "c"
 file-types = ["c"] # TODO: ["h"]
 roots = []
 comment-token = "//"
-language-server = { command = "clangd" }
+language-servers = [{ command = "clangd" }]
 indent = { tab-width = 2, unit = "  " }
 
 [language.debugger]
@@ -193,7 +191,7 @@ injection-regex = "cpp"
 file-types = ["cc", "hh", "cpp", "hpp", "h", "ipp", "tpp", "cxx", "hxx", "ixx", "txx", "ino"]
 roots = []
 comment-token = "//"
-language-server = { command = "clangd" }
+language-servers = [{ command = "clangd" }]
 indent = { tab-width = 2, unit = "  " }
 
 [language.debugger]
@@ -231,7 +229,7 @@ file-types = ["cs"]
 roots = ["sln", "csproj"]
 comment-token = "//"
 indent = { tab-width = 4, unit = "\t" }
-language-server = { command = "OmniSharp", args = [ "--languageserver" ] }
+language-servers = [{ command = "OmniSharp", args = [ "--languageserver" ] }]
 
 [language.debugger]
 name = "netcoredbg"
@@ -264,7 +262,7 @@ file-types = ["go"]
 roots = ["Gopkg.toml", "go.mod"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "gopls" }
+language-servers = [{ command = "gopls" }]
 # TODO: gopls needs utf-8 offsets?
 indent = { tab-width = 4, unit = "\t" }
 
@@ -311,7 +309,7 @@ file-types = ["go.mod"]
 roots = []
 auto-format = true
 comment-token = "//"
-language-server = { command = "gopls" }
+language-servers = [{ command = "gopls" }]
 indent = { tab-width = 4, unit = "\t" }
 
 [[grammar]]
@@ -325,7 +323,7 @@ injection-regex = "gotmpl"
 file-types = ["gotmpl"]
 roots = []
 comment-token = "//"
-language-server = { command = "gopls" }
+language-servers = [{ command = "gopls" }]
 indent = { tab-width = 2, unit = " " }
 
 [[grammar]]
@@ -340,7 +338,7 @@ file-types = ["go.work"]
 roots = []
 auto-format = true
 comment-token = "//"
-language-server = { command = "gopls" }
+language-servers = [{ command = "gopls" }]
 indent = { tab-width = 4, unit = "\t" }
 
 [[grammar]]
@@ -356,7 +354,7 @@ shebangs = ["node"]
 roots = []
 comment-token = "//"
 # TODO: highlights-params
-language-server = { command = "typescript-language-server", args = ["--stdio"], language-id = "javascript" }
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "javascript" }]
 indent = { tab-width = 2, unit = "  " }
 
 [language.debugger]
@@ -382,7 +380,7 @@ injection-regex = "jsx"
 file-types = ["jsx"]
 roots = []
 comment-token = "//"
-language-server = { command = "typescript-language-server", args = ["--stdio"], language-id = "javascriptreact" }
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "javascriptreact" }]
 indent = { tab-width = 2, unit = "  " }
 grammar = "javascript"
 
@@ -394,7 +392,7 @@ file-types = ["ts"]
 shebangs = []
 roots = []
 # TODO: highlights-params
-language-server = { command = "typescript-language-server", args = ["--stdio"], language-id = "typescript"}
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "typescript"}]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -408,7 +406,7 @@ injection-regex = "(tsx)" # |typescript
 file-types = ["tsx"]
 roots = []
 # TODO: highlights-params
-language-server = { command = "typescript-language-server", args = ["--stdio"], language-id = "typescriptreact" }
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "typescriptreact" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -421,7 +419,7 @@ scope = "source.css"
 injection-regex = "css"
 file-types = ["css", "scss"]
 roots = []
-language-server = { command = "vscode-css-language-server", args = ["--stdio"] }
+language-servers = [{ command = "vscode-css-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -434,7 +432,7 @@ scope = "source.scss"
 injection-regex = "scss"
 file-types = ["scss"]
 roots = []
-language-server = { command = "vscode-css-language-server", args = ["--stdio"] }
+language-servers = [{ command = "vscode-css-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -447,9 +445,8 @@ scope = "text.html.basic"
 injection-regex = "html"
 file-types = ["html"]
 roots = []
-language-server = { command = "vscode-html-language-server", args = ["--stdio"] }
+language-servers = [{ command = "vscode-html-language-server", args = ["--stdio"], config = { "provideFormatter" = true } }]
 auto-format = true
-config = { "provideFormatter" = true }
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -464,7 +461,7 @@ file-types = ["py"]
 shebangs = ["python"]
 roots = []
 comment-token = "#"
-language-server = { command = "pylsp" }
+language-servers = [{ command = "pylsp" }]
 # TODO: pyls needs utf-8 offsets
 indent = { tab-width = 4, unit = "    " }
 
@@ -480,7 +477,7 @@ file-types = ["ncl"]
 shebangs = []
 roots = []
 comment-token = "#"
-language-server = { command = "nls" }
+language-servers = [{ command = "nls" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -495,7 +492,7 @@ file-types = ["nix"]
 shebangs = []
 roots = []
 comment-token = "#"
-language-server = { command = "rnix-lsp" }
+language-servers = [{ command = "rnix-lsp" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -510,7 +507,7 @@ file-types = ["rb", "rake", "rakefile", "irb", "gemfile", "gemspec", "Rakefile",
 shebangs = ["ruby"]
 roots = []
 comment-token = "#"
-language-server = { command = "solargraph", args = ["stdio"] }
+language-servers = [{ command = "solargraph", args = ["stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -525,7 +522,7 @@ file-types = ["sh", "bash", "zsh", ".bash_login", ".bash_logout", ".bash_profile
 shebangs = ["sh", "bash", "dash"]
 roots = []
 comment-token = "#"
-language-server = { command = "bash-language-server", args = ["start"] }
+language-servers = [{ command = "bash-language-server", args = ["start"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -539,7 +536,7 @@ injection-regex = "php"
 file-types = ["php", "inc"]
 shebangs = ["php"]
 roots = ["composer.json", "index.php"]
-language-server = { command = "intelephense", args = ["--stdio"] }
+language-servers = [{ command = "intelephense", args = ["--stdio"] }]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
@@ -565,7 +562,7 @@ injection-regex = "tex"
 file-types = ["tex"]
 roots = []
 comment-token = "%"
-language-server = { command = "texlab" }
+language-servers = [{ command = "texlab" }]
 indent = { tab-width = 4, unit = "\t" }
 
 [[grammar]]
@@ -579,7 +576,7 @@ injection-regex = "lean"
 file-types = ["lean"]
 roots = [ "lakefile.lean" ]
 comment-token = "--"
-language-server = { command = "lean", args = [ "--server" ] }
+language-servers = [{ command = "lean", args = [ "--server" ] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -593,13 +590,13 @@ injection-regex = "julia"
 file-types = ["jl"]
 roots = []
 comment-token = "#"
-language-server = { command = "julia", args = [
+language-servers = [{ command = "julia", args = [
     "--startup-file=no",
     "--history-file=no",
     "--quiet",
     "-e",
     "using LanguageServer; runserver()",
-    ] }
+    ] }]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
@@ -612,7 +609,7 @@ scope = "source.java"
 injection-regex = "java"
 file-types = ["java"]
 roots = ["pom.xml"]
-language-server = { command = "jdtls" }
+language-servers = [{ command = "jdtls" }]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
@@ -653,7 +650,7 @@ file-types = ["ml"]
 shebangs = []
 roots = []
 comment-token = "(**)"
-language-server = { command = "ocamllsp" }
+language-servers = [{ command = "ocamllsp" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -667,7 +664,7 @@ file-types = ["mli"]
 shebangs = []
 roots = []
 comment-token = "(**)"
-language-server = { command = "ocamllsp" }
+language-servers = [{ command = "ocamllsp" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -682,7 +679,7 @@ shebangs = ["lua"]
 roots = [".luarc.json", ".luacheckrc", ".stylua.toml", "selene.toml", ".git"]
 comment-token = "--"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "lua-language-server", args = [] }
+language-servers = [{ command = "lua-language-server", args = [] }]
 
 [[grammar]]
 name = "lua"
@@ -695,7 +692,7 @@ injection-regex = "svelte"
 file-types = ["svelte"]
 roots = []
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "svelteserver", args = ["--stdio"] }
+language-servers = [{ command = "svelteserver", args = ["--stdio"] }]
 
 [[grammar]]
 name = "svelte"
@@ -708,7 +705,7 @@ injection-regex = "vue"
 file-types = ["vue"]
 roots = ["package.json", "vue.config.js"]
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "vls" }
+language-servers = [{ command = "vls" }]
 
 [[grammar]]
 name = "vue"
@@ -721,7 +718,7 @@ file-types = ["yml", "yaml"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "yaml-language-server", args = ["--stdio"] }
+language-servers = [{ command = "yaml-language-server", args = ["--stdio"] }]
 injection-regex = "yml|yaml"
 
 [[grammar]]
@@ -735,7 +732,7 @@ injection-regex = "haskell"
 file-types = ["hs"]
 roots = ["Setup.hs", "stack.yaml", "*.cabal"]
 comment-token = "--"
-language-server = { command = "haskell-language-server-wrapper", args = ["--lsp"] }
+language-servers = [{ command = "haskell-language-server-wrapper", args = ["--lsp"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -749,7 +746,7 @@ injection-regex = "purescript"
 file-types = ["purs"]
 roots = ["spago.dhall", "bower.json"]
 comment-token = "--"
-language-server = { command = "purescript-language-server", args = ["--stdio"] }
+language-servers = [{ command = "purescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 auto-format = true
 formatter = { command = "purs-tidy", args = ["format"] }
@@ -763,7 +760,7 @@ file-types = ["zig"]
 roots = ["build.zig"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "zls" }
+language-servers = [{ command = "zls" }]
 indent = { tab-width = 4, unit = "    " }
 formatter = { command = "zig" , args = ["fmt", "--stdin"] }
 
@@ -778,10 +775,10 @@ roots = []
 file-types = ["pl", "prolog"]
 shebangs = ["swipl"]
 comment-token = "%"
-language-server = { command = "swipl", args = [
+language-servers = [{ command = "swipl", args = [
     "-g", "use_module(library(lsp_server))",
     "-g", "lsp_server:main",
-    "-t", "halt", "--", "stdio"] }
+    "-t", "halt", "--", "stdio"] }]
 
 [[language]]
 name = "tsq"
@@ -803,7 +800,7 @@ file-types = ["cmake", "CMakeLists.txt"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "cmake-language-server" }
+language-servers = [{ command = "cmake-language-server" }]
 injection-regex = "cmake"
 
 [[grammar]]
@@ -856,7 +853,7 @@ roots = []
 file-types = ["rkt"]
 shebangs = ["racket"]
 comment-token = ";"
-language-server = { command = "racket", args = ["-l", "racket-langserver"] }
+language-servers = [{ command = "racket", args = ["-l", "racket-langserver"] }]
 
 [[language]]
 name = "comment"
@@ -875,7 +872,7 @@ scope = "source.wgsl"
 file-types = ["wgsl"]
 roots = []
 comment-token = "//"
-language-server = { command = "wgsl_analyzer" }
+language-servers = [{ command = "wgsl_analyzer" }]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
@@ -938,7 +935,7 @@ scope = "source.md"
 injection-regex = "md|markdown"
 file-types = ["md", "markdown"]
 roots = [".marksman.toml"]
-language-server = { command = "marksman", args=["server"] }
+language-servers = [{ command = "marksman", args=["server"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -964,7 +961,7 @@ file-types = ["dart"]
 roots = ["pubspec.yaml"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "dart", args = ["language-server", "--client-id=helix"] }
+language-servers = [{ command = "dart", args = ["language-server", "--client-id=helix"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -978,7 +975,7 @@ roots = ["build.sbt", "pom.xml"]
 file-types = ["scala", "sbt"]
 comment-token = "//"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "metals" }
+language-servers = [{ command = "metals" }]
 
 [[grammar]]
 name = "scala"
@@ -992,7 +989,7 @@ roots = ["Dockerfile"]
 file-types = ["Dockerfile", "dockerfile"]
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "docker-langserver", args = ["--stdio"] }
+language-servers = [{ command = "docker-langserver", args = ["--stdio"] }]
 
 [[grammar]]
 name = "dockerfile"
@@ -1109,7 +1106,7 @@ file-types = ["elm"]
 roots = ["elm.json"]
 auto-format = true
 comment-token = "--"
-language-server = { command = "elm-language-server" }
+language-servers = [{ command = "elm-language-server" }]
 indent = { tab-width = 4, unit = "    " }
 
 [[grammar]]
@@ -1135,7 +1132,7 @@ file-types = ["res"]
 roots = ["bsconfig.json"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "rescript-language-server", args = ["--stdio"] }
+language-servers = [{ command = "rescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -1150,7 +1147,7 @@ file-types = ["erl", "hrl", "app", "rebar.config", "rebar.lock"]
 roots = ["rebar.config"]
 comment-token = "%%"
 indent = { tab-width = 4, unit = "    " }
-language-server = { command = "erlang_ls" }
+language-servers = [{ command = "erlang_ls" }]
 
 [language.auto-pairs]
 '(' = ')'
@@ -1171,7 +1168,7 @@ file-types = ["kt", "kts"]
 roots = ["settings.gradle", "settings.gradle.kts"]
 comment-token = "//"
 indent = { tab-width = 4, unit = "    " }
-language-server = { command = "kotlin-language-server" }
+language-servers = [{ command = "kotlin-language-server" }]
 
 [[grammar]]
 name = "kotlin"
@@ -1185,7 +1182,7 @@ file-types = ["hcl", "tf", "nomad"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "terraform-ls", args = ["serve"], language-id = "terraform" }
+language-servers = [{ command = "terraform-ls", args = ["serve"], language-id = "terraform" }]
 auto-format = true
 
 [[grammar]]
@@ -1199,7 +1196,7 @@ file-types = ["tfvars"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "terraform-ls", args = ["serve"], language-id = "terraform-vars" }
+language-servers = [{ command = "terraform-ls", args = ["serve"], language-id = "terraform-vars" }]
 auto-format = true
 grammar = "hcl"
 
@@ -1223,7 +1220,7 @@ file-types = ["sol"]
 roots = []
 comment-token = "//"
 indent = { tab-width = 4, unit = "    " }
-language-server = { command = "solc", args = ["--lsp"] }
+language-servers = [{ command = "solc", args = ["--lsp"] }]
 
 [[grammar]]
 name = "solidity"
@@ -1237,7 +1234,7 @@ file-types = ["gleam"]
 roots = ["gleam.toml"]
 comment-token = "//"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "gleam", args = ["lsp"] }
+language-servers = [{ command = "gleam", args = ["lsp"] }]
 
 [[grammar]]
 name = "gleam"
@@ -1262,7 +1259,7 @@ shebangs = ["r", "R"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "R", args = ["--slave", "-e", "languageserver::run()"] }
+language-servers = [{ command = "R", args = ["--slave", "-e", "languageserver::run()"] }]
 
 [[grammar]]
 name = "r"
@@ -1276,7 +1273,7 @@ file-types = ["rmd", "Rmd"]
 roots = []
 indent = { tab-width = 2, unit = "  " }
 grammar = "markdown"
-language-server = { command = "R", args = ["--slave", "-e", "languageserver::run()"] }
+language-servers = [{ command = "R", args = ["--slave", "-e", "languageserver::run()"] }]
 
 [[language]]
 name = "swift"
@@ -1286,7 +1283,7 @@ file-types = ["swift"]
 roots = [ "Package.swift" ]
 comment-token = "//"
 auto-format = true
-language-server = { command = "sourcekit-lsp" }
+language-servers = [{ command = "sourcekit-lsp" }]
 
 [[grammar]]
 name = "swift"
@@ -1402,7 +1399,7 @@ file-types = ["vala", "vapi"]
 roots = []
 comment-token = "//"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "vala-language-server" }
+language-servers = [{ command = "vala-language-server" }]
 
 [[grammar]]
 name = "vala"
@@ -1467,7 +1464,7 @@ auto-format = false
 scope = "source.odin"
 file-types = ["odin"]
 roots = ["ols.json"]
-language-server = { command = "ols", args = [] }
+language-servers = [{ command = "ols", args = [] }]
 comment-token = "//"
 indent = { tab-width = 4, unit = "\t" }
 
@@ -1517,7 +1514,7 @@ scope = "source.v"
 file-types = ["v", "vv"]
 shebangs = ["v run"]
 roots = ["v.mod"]
-language-server = { command = "vls", args = [] }
+language-servers = [{ command = "vls", args = [] }]
 auto-format = true
 comment-token = "//"
 indent = { tab-width = 4, unit = "\t" }
@@ -1532,7 +1529,7 @@ scope = "source.verilog"
 file-types = ["v", "vh", "sv", "svh"]
 roots = []
 comment-token = "//"
-language-server = { command = "svlangserver", args = [] }
+language-servers = [{ command = "svlangserver", args = [] }]
 indent = { tab-width = 2, unit = "  " }
 injection-regex = "verilog"
 
@@ -1571,7 +1568,7 @@ injection-regex = "openscad"
 file-types = ["scad"]
 roots = []
 comment-token = "//"
-language-server = { command = "openscad-lsp", args = ["--stdio"] }
+language-servers = [{ command = "openscad-lsp", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "\t" }
 
 [[grammar]]
@@ -1585,7 +1582,7 @@ injection-regex = "prisma"
 file-types = ["prisma"]
 roots = ["package.json"]
 comment-token = "//"
-language-server = { command = "prisma-language-server", args = ["--stdio"] }
+language-servers = [{ command = "prisma-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -1599,7 +1596,7 @@ injection-regex = "(clojure|clj|edn|boot)"
 file-types = ["clj", "cljs", "cljc", "clje", "cljr", "cljx", "edn", "boot"]
 roots = ["project.clj", "build.boot", "deps.edn", "shadow-cljs.edn"]
 comment-token = ";"
-language-server = { command = "clojure-lsp" }
+language-servers = [{ command = "clojure-lsp" }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -1623,7 +1620,7 @@ file-types = ["elv"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "elvish", args = ["-lsp"] }
+language-servers = [{ command = "elvish", args = ["-lsp"] }]
 grammar = "elvish"
 
 [[grammar]]
@@ -1639,7 +1636,7 @@ shebangs = []
 roots = []
 comment-token = "--"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "idris2-lsp" }
+language-servers = [{ command = "idris2-lsp" }]
 
 [[language]]
 name = "fortran"
@@ -1649,7 +1646,7 @@ file-types = ["f", "for", "f90", "f95", "f03"]
 roots = ["fpm.toml"]
 comment-token = "!"
 indent = { tab-width = 4, unit = "    "}
-language-server = { command = "fortls", args = ["--lowercase_intrinsics"] }
+language-servers = [{ command = "fortls", args = ["--lowercase_intrinsics"] }]
 
 [[grammar]]
 name = "fortran"
@@ -1676,7 +1673,7 @@ file-types = ["dot"]
 roots = []
 comment-token = "//"
 indent = { tab-width = 4, unit = "    " }
-language-server = { command = "dot-language-server", args = ["--stdio"] }
+language-servers = [{ command = "dot-language-server", args = ["--stdio"] }]
 
 [[grammar]]
 name = "dot"
@@ -1690,7 +1687,7 @@ file-types = ["cue"]
 roots = ["cue.mod"]
 auto-format = true
 comment-token = "//"
-language-server = { command = "cuelsp" }
+language-servers = [{ command = "cuelsp" }]
 indent = { tab-width = 4, unit = "\t" }
 
 [[grammar]]
@@ -1705,7 +1702,7 @@ file-types = ["slint"]
 roots = []
 comment-token = "//"
 indent = { tab-width = 4, unit = "    " }
-language-server = { command = "slint-lsp", args = [] }
+language-servers = [{ command = "slint-lsp", args = [] }]
 
 [[grammar]]
 name = "slint"
@@ -1757,7 +1754,7 @@ file-types = ["pas", "pp", "inc", "lpr", "lfm"]
 roots = []
 comment-token = "//"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "pasls", args = [] }
+language-servers = [{ command = "pasls", args = [] }]
 
 [[grammar]]
 name = "pascal"
@@ -1782,7 +1779,7 @@ file-types = ["libsonnet", "jsonnet"]
 roots = ["jsonnetfile.json"]
 comment-token = "//"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "jsonnet-language-server", args= ["-t", "--lint"] }
+language-servers = [{ command = "jsonnet-language-server", args= ["-t", "--lint"] }]
 
 [[grammar]]
 name = "jsonnet"
@@ -1808,7 +1805,7 @@ file-types = ["bass"]
 roots = []
 comment-token = ";"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "bass", args = ["--lsp"] }
+language-servers = [{ command = "bass", args = ["--lsp"] }]
 
 [[grammar]]
 name = "bass"

@@ -75,9 +75,6 @@ pub struct LanguageConfiguration {
     pub comment_token: Option<String>,
     pub max_line_length: Option<usize>,
 
-    #[serde(default, skip_serializing, deserialize_with = "deserialize_lsp_config")]
-    pub config: Option<serde_json::Value>,
-
     #[serde(default)]
     pub auto_format: bool,
 
@@ -97,8 +94,8 @@ pub struct LanguageConfiguration {
     #[serde(skip)]
     pub(crate) highlight_config: OnceCell<Option<Arc<HighlightConfiguration>>>,
     // tags_config OnceCell<> https://github.com/tree-sitter/tree-sitter/pull/583
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub language_server: Option<LanguageServerConfiguration>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub language_servers: Vec<LanguageServerConfiguration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent: Option<IndentationConfiguration>,
 
@@ -126,6 +123,10 @@ pub struct LanguageServerConfiguration {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+
+    #[serde(default, skip_serializing, deserialize_with = "deserialize_lsp_config")]
+    pub config: Option<serde_json::Value>,
+
     #[serde(default = "default_timeout")]
     pub timeout: u64,
     pub language_id: Option<String>,
