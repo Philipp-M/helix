@@ -13,19 +13,13 @@ use futures_util::stream::select_all::SelectAll;
 use helix_core::syntax::{LanguageConfiguration, LanguageServerConfiguration};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use thiserror::Error;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 pub type Result<T> = core::result::Result<T, Error>;
-type LanguageId = String;
+type LanguageServerName = String;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -45,7 +39,7 @@ pub enum Error {
     Other(#[from] anyhow::Error),
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OffsetEncoding {
     /// UTF-8 code units aka bytes
     Utf8,
@@ -605,23 +599,18 @@ impl Notification {
 
 #[derive(Debug)]
 pub struct Registry {
-    inner: HashMap<LanguageId, (usize, Arc<Client>)>,
-
-    counter: AtomicUsize,
+    inner: HashMap<LanguageServerName, Arc<Client>>,
+    syn_loader: Arc<helix_core::syntax::Loader>,
+    counter: usize,
     pub incoming: SelectAll<UnboundedReceiverStream<(usize, Call)>>,
 }
 
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Registry {
-    pub fn new() -> Self {
+    pub fn new(syn_loader: Arc<helix_core::syntax::Loader>) -> Self {
         Self {
             inner: HashMap::new(),
-            counter: AtomicUsize::new(0),
+            syn_loader,
+            counter: 0,
             incoming: SelectAll::new(),
         }
     }
@@ -629,85 +618,99 @@ impl Registry {
     pub fn get_by_id(&self, id: usize) -> Option<&Client> {
         self.inner
             .values()
-            .find(|(client_id, _)| client_id == &id)
-            .map(|(_, client)| client.as_ref())
+            .find(|client| client.id() == id)
+            .map(|client| &**client)
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Option<&Client> {
+        self.inner.get(name).map(|client| &**client)
     }
 
     pub fn remove_by_id(&mut self, id: usize) {
-        self.inner.retain(|_, (client_id, _)| client_id != &id)
+        self.inner.retain(|_, ls| id != ls.id());
+    }
+
+    fn start_client(
+        &mut self,
+        name: String,
+        roots: &[String],
+        doc_path: Option<&std::path::PathBuf>,
+    ) -> Result<Arc<Client>> {
+        let config = self
+            .syn_loader
+            .language_server_configs()
+            .get(&name)
+            .ok_or_else(|| anyhow::anyhow!("Language server '{name}' not defined"))?;
+        // initialize a new client
+        // let id = self.counter.fetch_add(1, Ordering::Relaxed);
+        self.counter += 1;
+        let id = self.counter;
+        let NewClient(client, incoming) = start_client(id, name, config, roots, doc_path)?;
+        self.incoming.push(UnboundedReceiverStream::new(incoming));
+        Ok(client)
     }
 
     pub fn restart(
         &mut self,
-        language_config: &LanguageConfiguration,
+        lang_config: &LanguageConfiguration,
         doc_path: Option<&std::path::PathBuf>,
-    ) -> Result<Option<Arc<Client>>> {
-        let config = match &language_config.language_server {
-            Some(config) => config,
-            None => return Ok(None),
-        };
+    ) -> Result<Vec<Arc<Client>>> {
+        lang_config
+            .language_servers
+            .iter()
+            .filter_map(|config| {
+                let name = config.name().clone();
 
-        let scope = language_config.scope.clone();
+                #[allow(clippy::map_entry)]
+                if self.inner.contains_key(&name) {
+                    let client = match self.start_client(name.clone(), &lang_config.roots, doc_path)
+                    {
+                        Ok(client) => client,
+                        error => return Some(error),
+                    };
 
-        match self.inner.entry(scope) {
-            Entry::Vacant(_) => Ok(None),
-            Entry::Occupied(mut entry) => {
-                // initialize a new client
-                let id = self.counter.fetch_add(1, Ordering::Relaxed);
+                    let old_client = self.inner.insert(name, client.clone()).unwrap();
 
-                let NewClientResult(client, incoming) =
-                    start_client(id, language_config, config, doc_path)?;
-                self.incoming.push(UnboundedReceiverStream::new(incoming));
+                    tokio::spawn(async move {
+                        let _ = old_client.force_shutdown().await;
+                    });
 
-                let (_, old_client) = entry.insert((id, client.clone()));
-
-                tokio::spawn(async move {
-                    let _ = old_client.force_shutdown().await;
-                });
-
-                Ok(Some(client))
-            }
-        }
+                    Some(Ok(client))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
-    pub fn stop(&mut self, language_config: &LanguageConfiguration) {
-        let scope = language_config.scope.clone();
-
-        if let Some((_, client)) = self.inner.remove(&scope) {
-            tokio::spawn(async move {
-                let _ = client.force_shutdown().await;
-            });
+    pub fn stop(&mut self, name: &str) {
+        if let Some(client) = self.inner.remove(name) {
+            tokio::spawn(async move { client.force_shutdown().await.ok() });
         }
     }
 
     pub fn get(
         &mut self,
-        language_config: &LanguageConfiguration,
+        lang_config: &LanguageConfiguration,
         doc_path: Option<&std::path::PathBuf>,
-    ) -> Result<Option<Arc<Client>>> {
-        let config = match &language_config.language_server {
-            Some(config) => config,
-            None => return Ok(None),
-        };
-
-        match self.inner.entry(language_config.scope.clone()) {
-            Entry::Occupied(entry) => Ok(Some(entry.get().1.clone())),
-            Entry::Vacant(entry) => {
-                // initialize a new client
-                let id = self.counter.fetch_add(1, Ordering::Relaxed);
-
-                let NewClientResult(client, incoming) =
-                    start_client(id, language_config, config, doc_path)?;
-                self.incoming.push(UnboundedReceiverStream::new(incoming));
-
-                entry.insert((id, client.clone()));
-                Ok(Some(client))
-            }
-        }
+    ) -> Result<Vec<Arc<Client>>> {
+        lang_config
+            .language_servers
+            .iter()
+            .map(|config| match self.inner.get(config.name()) {
+                Some(client) => Ok(client.clone()),
+                None => {
+                    let client =
+                        self.start_client(config.name().clone(), &lang_config.roots, doc_path)?;
+                    self.inner.insert(config.name().clone(), client.clone());
+                    Ok(client)
+                }
+            })
+            .collect()
     }
 
     pub fn iter_clients(&self) -> impl Iterator<Item = &Arc<Client>> {
-        self.inner.values().map(|(_, client)| client)
+        self.inner.values()
     }
 }
 
@@ -789,23 +792,25 @@ impl LspProgressMap {
     }
 }
 
-struct NewClientResult(Arc<Client>, UnboundedReceiver<(usize, Call)>);
+struct NewClient(Arc<Client>, UnboundedReceiver<(usize, Call)>);
 
 /// start_client takes both a LanguageConfiguration and a LanguageServerConfiguration to ensure that
 /// it is only called when it makes sense.
 fn start_client(
     id: usize,
-    config: &LanguageConfiguration,
+    name: String,
     ls_config: &LanguageServerConfiguration,
+    roots: &[String],
     doc_path: Option<&std::path::PathBuf>,
-) -> Result<NewClientResult> {
+) -> Result<NewClient> {
     let (client, incoming, initialize_notify) = Client::start(
         &ls_config.command,
         &ls_config.args,
-        config.config.clone(),
+        ls_config.config.clone(),
         ls_config.environment.clone(),
-        &config.roots,
+        roots,
         id,
+        name,
         ls_config.timeout,
         doc_path,
     )?;
@@ -839,7 +844,7 @@ fn start_client(
         initialize_notify.notify_one();
     });
 
-    Ok(NewClientResult(client, incoming))
+    Ok(NewClient(client, incoming))
 }
 
 #[cfg(test)]
