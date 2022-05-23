@@ -1256,23 +1256,20 @@ fn lsp_workspace_command(
     if event != PromptEvent::Validate {
         return Ok(());
     }
-
-    let (_, doc) = current!(cx.editor);
-
-    let language_server = match doc.language_server() {
-        Some(language_server) => language_server,
+    let doc = doc!(cx.editor);
+    let language_servers =
+        doc.language_servers_with_feature(LanguageServerFeature::WorkspaceCommand);
+    let (language_server_id, options) = match language_servers.iter().find_map(|ls| {
+        ls.capabilities()
+            .execute_command_provider
+            .as_ref()
+            .map(|options| (ls.id(), options))
+    }) {
+        Some(id_options) => id_options,
         None => {
-            cx.editor
-                .set_status("Language server not active for current buffer");
-            return Ok(());
-        }
-    };
-
-    let options = match &language_server.capabilities().execute_command_provider {
-        Some(options) => options,
-        None => {
-            cx.editor
-                .set_status("Workspace commands are not supported for this language server");
+            cx.editor.set_status(
+                "No active language servers for this document support workspace commands",
+            );
             return Ok(());
         }
     };
@@ -1290,8 +1287,8 @@ fn lsp_workspace_command(
             let call: job::Callback = Callback::EditorCompositor(Box::new(
                 move |_editor: &mut Editor, compositor: &mut Compositor| {
                     let option_manager = OptionsManager::create_from_items(commands, ());
-                    let picker = ui::Picker::new(option_manager, |cx, command, _action| {
-                        execute_lsp_command(cx.editor, command.clone());
+                    let picker = ui::Picker::new(option_manager, move |cx, command, _action| {
+                        execute_lsp_command(cx.editor, language_server_id, command.clone());
                     });
                     compositor.push(Box::new(overlayed(picker)))
                 },
@@ -1304,6 +1301,7 @@ fn lsp_workspace_command(
         if options.commands.iter().any(|c| c == &command) {
             execute_lsp_command(
                 cx.editor,
+                language_server_id,
                 helix_lsp::lsp::Command {
                     title: command.clone(),
                     arguments: None,
@@ -1348,7 +1346,7 @@ fn lsp_restart(
         .collect();
 
     for document_id in document_ids_to_refresh {
-        cx.editor.refresh_language_server(document_id);
+        cx.editor.refresh_language_servers(document_id);
     }
 
     Ok(())
@@ -1712,7 +1710,7 @@ fn language(
     doc.detect_indent_and_line_ending();
 
     let id = doc.id();
-    cx.editor.refresh_language_server(id);
+    cx.editor.refresh_language_servers(id);
     Ok(())
 }
 
@@ -2338,7 +2336,7 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         TypableCommand {
             name: "lsp-restart",
             aliases: &[],
-            doc: "Restarts the Language Server that is in use by the current doc",
+            doc: "Restarts the language servers used by the currently opened file",
             fun: lsp_restart,
             completer: None,
         },

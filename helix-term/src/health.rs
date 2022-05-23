@@ -2,7 +2,10 @@ use crossterm::{
     style::{Color, Print, Stylize},
     tty::IsTty,
 };
-use helix_core::config::{default_syntax_loader, user_syntax_loader};
+use helix_core::{
+    config::{default_syntax_loader, user_syntax_loader},
+    syntax::LanguageServerFeatureConfiguration,
+};
 use helix_loader::grammar::load_runtime_file;
 use helix_view::clipboard::get_clipboard_provider;
 use std::io::Write;
@@ -178,10 +181,18 @@ pub fn languages_all() -> std::io::Result<()> {
     for lang in &syn_loader_conf.language {
         column(&lang.language_id, Color::Reset);
 
-        let lsp = lang
-            .language_server
-            .as_ref()
-            .map(|lsp| lsp.command.to_string());
+        // TODO multiple language servers
+
+        let lsp = lang.language_servers.first().and_then(|lsp| {
+            let name = match lsp {
+                LanguageServerFeatureConfiguration::Simple(name) => name,
+                LanguageServerFeatureConfiguration::Features { name, .. } => name,
+            };
+            syn_loader_conf
+                .language_server
+                .get(name)
+                .map(|config| config.command.clone())
+        });
         check_binary(lsp);
 
         let dap = lang.debugger.as_ref().map(|dap| dap.command.to_string());
@@ -250,11 +261,19 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
         }
     };
 
+    // TODO multiple language servers
     probe_protocol(
         "language server",
-        lang.language_server
-            .as_ref()
-            .map(|lsp| lsp.command.to_string()),
+        lang.language_servers.first().and_then(|lsp| {
+            let name = match lsp {
+                LanguageServerFeatureConfiguration::Simple(name) => name,
+                LanguageServerFeatureConfiguration::Features { name, .. } => name,
+            };
+            syn_loader_conf
+                .language_server
+                .get(name)
+                .map(|config| config.command.clone())
+        }),
     )?;
 
     probe_protocol(

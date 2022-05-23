@@ -4,7 +4,7 @@ use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
 use helix_core::doc_formatter::TextFormat;
-use helix_core::syntax::Highlight;
+use helix_core::syntax::{Highlight, LanguageServerFeature, LanguageServerFeatureConfiguration};
 use helix_core::text_annotations::TextAnnotations;
 use helix_core::Range;
 use helix_vcs::{DiffHandle, DiffProviderRegistry};
@@ -13,7 +13,7 @@ use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -145,7 +145,7 @@ pub struct Document {
     pub(crate) modified_since_accessed: bool,
 
     diagnostics: Vec<Diagnostic>,
-    language_server: Option<Arc<helix_lsp::Client>>,
+    language_servers: Vec<Arc<helix_lsp::Client>>,
 
     diff_handle: Option<DiffHandle>,
 }
@@ -391,7 +391,7 @@ impl Document {
             last_saved_time: SystemTime::now(),
             last_saved_revision: 0,
             modified_since_accessed: false,
-            language_server: None,
+            language_servers: Vec::new(),
             diff_handle: None,
             config,
         }
@@ -503,19 +503,24 @@ impl Document {
             return Some(formatting_future.boxed());
         };
 
-        let language_server = self.language_server()?;
         let text = self.text.clone();
-        let offset_encoding = language_server.offset_encoding();
-
-        let request = language_server.text_document_formatting(
-            self.identifier(),
-            lsp::FormattingOptions {
-                tab_size: self.tab_width() as u32,
-                insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
-                ..Default::default()
-            },
-            None,
-        )?;
+        // finds first language server that supports formatting and then formats
+        let (offset_encoding, request) = self
+            .language_servers_with_feature(LanguageServerFeature::Format)
+            .iter()
+            .find_map(|language_server| {
+                let offset_encoding = language_server.offset_encoding();
+                let request = language_server.text_document_formatting(
+                    self.identifier(),
+                    lsp::FormattingOptions {
+                        tab_size: self.tab_width() as u32,
+                        insert_spaces: matches!(self.indent_style, IndentStyle::Spaces(_)),
+                        ..Default::default()
+                    },
+                    None,
+                )?;
+                Some((offset_encoding, request))
+            })?;
 
         let fut = async move {
             let edits = request.await.unwrap_or_else(|e| {
@@ -570,13 +575,12 @@ impl Document {
                 if self.path.is_none() {
                     bail!("Can't save with no path set!");
                 }
-
                 self.path.as_ref().unwrap().clone()
             }
         };
 
         let identifier = self.path().map(|_| self.identifier());
-        let language_server = self.language_server.clone();
+        let language_servers = self.language_servers.clone();
 
         // mark changes up to now as saved
         let current_rev = self.get_current_revision();
@@ -621,14 +625,13 @@ impl Document {
                 text: text.clone(),
             };
 
-            if let Some(language_server) = language_server {
+            for language_server in language_servers {
                 if !language_server.is_initialized() {
                     return Ok(event);
                 }
-
-                if let Some(identifier) = identifier {
+                if let Some(identifier) = &identifier {
                     if let Some(notification) =
-                        language_server.text_document_did_save(identifier, &text)
+                        language_server.text_document_did_save(identifier.clone(), &text)
                     {
                         notification.await?;
                     }
@@ -767,8 +770,8 @@ impl Document {
     }
 
     /// Set the LSP.
-    pub fn set_language_server(&mut self, language_server: Option<Arc<helix_lsp::Client>>) {
-        self.language_server = language_server;
+    pub fn set_language_servers(&mut self, language_servers: Vec<Arc<helix_lsp::Client>>) {
+        self.language_servers = language_servers;
     }
 
     /// Select text within the [`Document`].
@@ -871,7 +874,7 @@ impl Document {
                 .sort_unstable_by_key(|diagnostic| diagnostic.range);
 
             // emit lsp notification
-            if let Some(language_server) = self.language_server() {
+            for language_server in self.language_servers() {
                 let notify = language_server.text_document_did_change(
                     self.versioned_identifier(),
                     &old_doc,
@@ -1069,18 +1072,13 @@ impl Document {
             .map(|language| language.language_id.as_str())
     }
 
-    /// Language ID for the document. Either the `language-id` from the
-    /// `language-server` configuration, or the document language if no
-    /// `language-id` has been specified.
+    /// Language ID for the document. Either the `language-id`,
+    /// or the document language name if no `language-id` has been specified.
     pub fn language_id(&self) -> Option<&str> {
-        let language_config = self.language.as_deref()?;
-
-        language_config
-            .language_server
-            .as_ref()?
-            .language_id
+        self.language_config()?
+            .language_server_language_id
             .as_deref()
-            .or(Some(language_config.language_id.as_str()))
+            .or_else(|| self.language_name())
     }
 
     /// Corresponding [`LanguageConfiguration`].
@@ -1093,10 +1091,79 @@ impl Document {
         self.version
     }
 
-    /// Language server if it has been initialized.
-    pub fn language_server(&self) -> Option<&helix_lsp::Client> {
-        let server = self.language_server.as_deref()?;
-        server.is_initialized().then_some(server)
+    /// Language servers that have been initialized.
+    pub fn language_servers(&self) -> Vec<&helix_lsp::Client> {
+        self.language_servers
+            .iter()
+            .filter_map(|l| if l.is_initialized() { Some(&**l) } else { None })
+            .collect()
+    }
+
+    // TODO This and `language_servers_with_feature` could do a more sophisticated check if the language server really provides the feature
+    // i.e. check if the language server has the requested capability as well
+    // This method could also be moved somewhere else (likely into helix-lsp)
+    pub fn language_server_supports_feature(
+        &self,
+        language_server: &helix_lsp::Client,
+        feature: LanguageServerFeature,
+    ) -> bool {
+        let language_config = match self.language_config() {
+            Some(language_config) => language_config,
+            None => return false,
+        };
+        language_config.language_servers.iter().any(|c| match c {
+            LanguageServerFeatureConfiguration::Simple(name) => name == language_server.name(),
+            LanguageServerFeatureConfiguration::Features {
+                only_features,
+                except_features,
+                name,
+            } => {
+                name == language_server.name()
+                    && (only_features.is_empty() || only_features.contains(&feature))
+                    && !except_features.contains(&feature)
+            }
+        })
+    }
+
+    pub fn language_servers_with_feature(
+        &self,
+        feature: LanguageServerFeature,
+    ) -> Vec<&helix_lsp::Client> {
+        let language_servers = self.language_servers();
+
+        let language_config = match self.language_config() {
+            Some(language_config) => language_config,
+            None => return Vec::new(),
+        };
+
+        // O(n^2) but since language_servers will be of very small length,
+        // I don't see the necessity to optimize
+        language_config
+            .language_servers
+            .iter()
+            .filter_map(|c| match c {
+                LanguageServerFeatureConfiguration::Simple(name) => language_servers
+                    .iter()
+                    .find(|ls| ls.name() == name)
+                    .copied(),
+                LanguageServerFeatureConfiguration::Features {
+                    only_features,
+                    except_features,
+                    name,
+                } => {
+                    if (only_features.is_empty() || only_features.contains(&feature))
+                        && !except_features.contains(&feature)
+                    {
+                        language_servers
+                            .iter()
+                            .find(|ls| ls.name() == name)
+                            .copied()
+                    } else {
+                        None
+                    }
+                }
+            })
+            .collect()
     }
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
@@ -1202,10 +1269,26 @@ impl Document {
         &self.diagnostics
     }
 
-    pub fn set_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
-        self.diagnostics = diagnostics;
+    pub fn shown_diagnostics(&self) -> impl Iterator<Item = &Diagnostic> {
+        let ls_ids: HashSet<_> = self
+            .language_servers_with_feature(LanguageServerFeature::Diagnostics)
+            .iter()
+            .map(|ls| ls.id())
+            .collect();
+        self.diagnostics
+            .iter()
+            .filter(move |d| ls_ids.contains(&d.language_server_id))
+    }
+
+    pub fn append_diagnostics(&mut self, mut diagnostics: Vec<Diagnostic>) {
+        self.diagnostics.append(&mut diagnostics);
         self.diagnostics
             .sort_unstable_by_key(|diagnostic| diagnostic.range);
+    }
+
+    pub fn clear_diagnostics(&mut self, language_server_id: usize) {
+        self.diagnostics
+            .retain(|d| d.language_server_id != language_server_id);
     }
 
     /// Get the document's auto pairs. If the document has a recognized

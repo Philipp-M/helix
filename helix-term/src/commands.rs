@@ -22,6 +22,7 @@ use helix_core::{
     regex::{self, Regex, RegexBuilder},
     search::{self, CharMatcher},
     selection, shellwords, surround,
+    syntax::LanguageServerFeature,
     text_annotations::TextAnnotations,
     textobject,
     tree_sitter::Node,
@@ -2948,7 +2949,7 @@ fn exit_select_mode(cx: &mut Context) {
 
 fn goto_first_diag(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let selection = match doc.diagnostics().first() {
+    let selection = match doc.shown_diagnostics().next() {
         Some(diag) => Selection::single(diag.range.start, diag.range.end),
         None => return,
     };
@@ -2958,7 +2959,7 @@ fn goto_first_diag(cx: &mut Context) {
 
 fn goto_last_diag(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let selection = match doc.diagnostics().last() {
+    let selection = match doc.shown_diagnostics().last() {
         Some(diag) => Selection::single(diag.range.start, diag.range.end),
         None => return,
     };
@@ -2975,10 +2976,9 @@ fn goto_next_diag(cx: &mut Context) {
         .cursor(doc.text().slice(..));
 
     let diag = doc
-        .diagnostics()
-        .iter()
+        .shown_diagnostics()
         .find(|diag| diag.range.start > cursor_pos)
-        .or_else(|| doc.diagnostics().first());
+        .or_else(|| doc.shown_diagnostics().next());
 
     let selection = match diag {
         Some(diag) => Selection::single(diag.range.start, diag.range.end),
@@ -2997,11 +2997,12 @@ fn goto_prev_diag(cx: &mut Context) {
         .cursor(doc.text().slice(..));
 
     let diag = doc
-        .diagnostics()
-        .iter()
+        .shown_diagnostics()
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
         .find(|diag| diag.range.start < cursor_pos)
-        .or_else(|| doc.diagnostics().last());
+        .or_else(|| doc.shown_diagnostics().last());
 
     let selection = match diag {
         // NOTE: the selection is reversed because we're jumping to the
@@ -3160,23 +3161,20 @@ pub mod insert {
         use helix_lsp::lsp;
         // if ch matches completion char, trigger completion
         let doc = doc_mut!(cx.editor);
-        let language_server = match doc.language_server() {
-            Some(language_server) => language_server,
-            None => return,
-        };
+        let language_servers = doc.language_servers_with_feature(LanguageServerFeature::Completion);
+        let trigger_completion = language_servers.iter().any(|ls| {
+            let capabilities = ls.capabilities();
 
-        let capabilities = language_server.capabilities();
-
-        if let Some(lsp::CompletionOptions {
-            trigger_characters: Some(triggers),
-            ..
-        }) = &capabilities.completion_provider
-        {
             // TODO: what if trigger is multiple chars long
-            if triggers.iter().any(|trigger| trigger.contains(ch)) {
-                cx.editor.clear_idle_timer();
-                super::completion(cx);
-            }
+            matches!(&capabilities.completion_provider, Some(lsp::CompletionOptions {
+                    trigger_characters: Some(triggers),
+                    ..
+                }) if triggers.iter().any(|trigger| trigger.contains(ch)))
+        });
+
+        if trigger_completion {
+            cx.editor.clear_idle_timer();
+            super::completion(cx);
         }
     }
 
@@ -3184,36 +3182,41 @@ pub mod insert {
         use helix_lsp::lsp;
         // if ch matches signature_help char, trigger
         let doc = doc_mut!(cx.editor);
-        // The language_server!() macro is not used here since it will
-        // print an "LSP not active for current buffer" message on
-        // every keypress.
-        let language_server = match doc.language_server() {
-            Some(language_server) => language_server,
-            None => return,
-        };
+        // lsp doesn't tell us when to close the signature help, so we request
+        // the help information again after common close triggers which should
+        // return None, which in turn closes the popup.
+        let close_triggers = &[')', ';', '.'];
+        let language_servers =
+            doc.language_servers_with_feature(LanguageServerFeature::SignatureHelp);
+        let language_server_id = language_servers.iter().find_map(|ls| {
+            let capabilities = ls.capabilities();
 
-        let capabilities = language_server.capabilities();
-
-        if let lsp::ServerCapabilities {
-            signature_help_provider:
-                Some(lsp::SignatureHelpOptions {
-                    trigger_characters: Some(triggers),
-                    // TODO: retrigger_characters
+            match capabilities {
+                lsp::ServerCapabilities {
+                    signature_help_provider:
+                        Some(lsp::SignatureHelpOptions {
+                            trigger_characters: Some(triggers),
+                            // TODO: retrigger_characters
+                            ..
+                        }),
                     ..
-                }),
-            ..
-        } = capabilities
-        {
-            // TODO: what if trigger is multiple chars long
-            let is_trigger = triggers.iter().any(|trigger| trigger.contains(ch));
-            // lsp doesn't tell us when to close the signature help, so we request
-            // the help information again after common close triggers which should
-            // return None, which in turn closes the popup.
-            let close_triggers = &[')', ';', '.'];
-
-            if is_trigger || close_triggers.contains(&ch) {
-                super::signature_help_impl(cx, SignatureHelpInvoked::Automatic);
+                } if triggers.iter().any(|trigger| trigger.contains(ch))
+                    || close_triggers.contains(&ch) =>
+                {
+                    Some(ls.id())
+                }
+                _ if close_triggers.contains(&ch) => Some(ls.id()),
+                // TODO: what if trigger is multiple chars long
+                _ => None,
             }
+        });
+
+        if let Some(id) = language_server_id {
+            super::signature_help_impl_with_language_server_id(
+                cx,
+                id,
+                SignatureHelpInvoked::Automatic,
+            )
         }
     }
 
@@ -3227,7 +3230,7 @@ pub mod insert {
         Some(transaction)
     }
 
-    use helix_core::auto_pairs;
+    use helix_core::{auto_pairs, syntax::LanguageServerFeature};
 
     pub fn insert_char(cx: &mut Context, c: char) {
         let (view, doc) = current_ref!(cx.editor);
@@ -4002,8 +4005,11 @@ fn format_selections(cx: &mut Context) {
     // via lsp if available
     // TODO: else via tree-sitter indentation calculations
 
-    let language_server = match doc.language_server() {
-        Some(language_server) => language_server,
+    let language_server = match doc
+        .language_servers_with_feature(LanguageServerFeature::Format)
+        .first()
+    {
+        Some(language_server) => *language_server,
         None => return,
     };
 
@@ -4176,23 +4182,8 @@ pub fn completion(cx: &mut Context) {
 
     let (view, doc) = current!(cx.editor);
 
-    let language_server = match doc.language_server() {
-        Some(language_server) => language_server,
-        None => return,
-    };
-
-    let language_server_id = language_server.id();
-    let offset_encoding = language_server.offset_encoding();
     let text = doc.text().slice(..);
     let cursor = doc.selection(view.id).primary().cursor(text);
-
-    let pos = pos_to_lsp_pos(doc.text(), cursor, offset_encoding);
-
-    let future = match language_server.completion(doc.identifier(), pos, None) {
-        Some(future) => future,
-        None => return,
-    };
-
     let trigger_offset = cursor;
 
     // TODO: trigger_offset should be the cursor offset but we also need a starting offset from where we want to apply
@@ -4204,9 +4195,14 @@ pub fn completion(cx: &mut Context) {
     let offset = iter.take_while(|ch| chars::char_is_word(*ch)).count();
     let start_offset = cursor.saturating_sub(offset);
 
-    let completion_item_source = ItemSource::from_async_data(
-        async move {
-            let json = future.await?;
+    let create_completion_item_source = |language_server: &&helix_lsp::Client| {
+        let language_server_id = language_server.id();
+        let offset_encoding = language_server.offset_encoding();
+        let pos = pos_to_lsp_pos(doc.text(), cursor, offset_encoding);
+        let completion_request = language_server.completion(doc.identifier(), pos, None)?;
+
+        let item_source = async move {
+            let json = completion_request.await?;
             let response: helix_lsp::lsp::CompletionResponse = serde_json::from_value(json)?;
 
             let mut items = match response {
@@ -4229,12 +4225,19 @@ pub fn completion(cx: &mut Context) {
                 })
                 .collect())
         }
-        .boxed(),
-        (),
-    );
+        .boxed();
+
+        Some(ItemSource::from_async_data(item_source, ()))
+    };
+
+    let item_sources = doc
+        .language_servers_with_feature(LanguageServerFeature::Completion)
+        .iter()
+        .filter_map(create_completion_item_source)
+        .collect();
 
     OptionsManager::create_from_item_sources(
-        vec![completion_item_source],
+        item_sources,
         cx.editor,
         cx.jobs,
         move |editor, compositor, option_manager| {
@@ -4245,6 +4248,8 @@ pub fn completion(cx: &mut Context) {
 
             let size = compositor.size();
             let ui = compositor.find::<ui::EditorView>().unwrap();
+            // TODO doc id etc. everything that decouples this request from the current document/view etc. so that it's self contained
+            // Though it's not strictly necessary (as completion will be closed/canceled if escaping insert mode, so... nitpick)
             ui.set_completion(editor, option_manager, start_offset, trigger_offset, size);
         },
         Some(Box::new(|editor: &mut Editor| {
