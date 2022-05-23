@@ -534,15 +534,10 @@ impl Application {
                     }
                     Notification::PublishDiagnostics(mut params) => {
                         let path = params.uri.to_file_path().unwrap();
+                        let offset_encoding = get_language_server!().offset_encoding();
                         let doc = self.editor.document_by_path_mut(&path);
 
                         if let Some(doc) = doc {
-                            let language_server = doc
-                                .language_servers()
-                                .iter()
-                                .find(|l| l.id() == server_id)
-                                .copied()
-                                .unwrap();
                             let lang_conf = doc.language_config();
                             let text = doc.text();
 
@@ -558,7 +553,7 @@ impl Application {
                                     let start = if let Some(start) = lsp_pos_to_pos(
                                         text,
                                         diagnostic.range.start,
-                                        language_server.offset_encoding(),
+                                        offset_encoding,
                                     ) {
                                         start
                                     } else {
@@ -566,11 +561,9 @@ impl Application {
                                         return None;
                                     };
 
-                                    let end = if let Some(end) = lsp_pos_to_pos(
-                                        text,
-                                        diagnostic.range.end,
-                                        language_server.offset_encoding(),
-                                    ) {
+                                    let end = if let Some(end) =
+                                        lsp_pos_to_pos(text, diagnostic.range.end, offset_encoding)
+                                    {
                                         end
                                     } else {
                                         log::warn!("lsp position out of bounds - {:?}", diagnostic);
@@ -643,13 +636,16 @@ impl Application {
                         params
                             .diagnostics
                             .sort_unstable_by_key(|d| (d.severity, d.range.start));
+                        let diagnostics = params
+                            .diagnostics
+                            .into_iter()
+                            .map(|d| (d, offset_encoding))
+                            .collect();
 
                         // Insert the original lsp::Diagnostics here because we may have no open document
                         // for diagnosic message and so we can't calculate the exact position.
                         // When using them later in the diagnostics picker, we calculate them on-demand.
-                        self.editor
-                            .diagnostics
-                            .insert(params.uri, params.diagnostics);
+                        self.editor.diagnostics.insert(params.uri, diagnostics);
                     }
                     Notification::ShowMessage(params) => {
                         log::warn!("unhandled window/showMessage: {:?}", params);

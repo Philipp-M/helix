@@ -39,7 +39,7 @@ use helix_core::{
     Change,
 };
 use helix_dap as dap;
-use helix_lsp::lsp;
+use helix_lsp::{lsp, OffsetEncoding};
 
 use serde::{ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -655,7 +655,7 @@ pub struct Editor {
     pub macro_recording: Option<(char, Vec<KeyEvent>)>,
     pub macro_replaying: Vec<char>,
     pub language_servers: helix_lsp::Registry,
-    pub diagnostics: BTreeMap<lsp::Url, Vec<lsp::Diagnostic>>,
+    pub diagnostics: BTreeMap<lsp::Url, Vec<(lsp::Diagnostic, OffsetEncoding)>>,
 
     pub debugger: Option<dap::Client>,
     pub debugger_events: SelectAll<UnboundedReceiverStream<dap::Payload>>,
