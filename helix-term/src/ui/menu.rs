@@ -57,6 +57,8 @@ pub struct Menu<T: Item> {
     /// (index, score)
     matches: Vec<(usize, i64)>,
 
+    previous_pattern: String,
+
     widths: Vec<Constraint>,
 
     callback_fn: Box<dyn Fn(&mut Editor, Option<&T>, MenuEvent)>,
@@ -82,6 +84,7 @@ impl<T: Item> Menu<T> {
             editor_data,
             matcher: Box::new(Matcher::default()),
             matches: Vec::new(),
+            previous_pattern: String::new(),
             cursor: None,
             widths: Vec::new(),
             callback_fn: Box::new(callback_fn),
@@ -91,36 +94,70 @@ impl<T: Item> Menu<T> {
             recalculate: true,
         };
 
-        // TODO: scoring on empty input should just use a fastpath
-        menu.score("");
-
+        menu.re_score(true);
         menu
     }
 
-    pub fn score(&mut self, pattern: &str) {
+    pub fn re_score(&mut self, reset_cursor: bool) {
+        let prev_matched_option = if !reset_cursor {
+            self.cursor
+                .and_then(|c| self.matches.get(c).map(|(index, _)| *index))
+        } else {
+            None
+        };
+
         // reuse the matches allocation
         self.matches.clear();
-        self.matches.extend(
-            self.options
-                .iter()
-                .enumerate()
-                .filter_map(|(index, option)| {
-                    let text = option.filter_text(&self.editor_data);
-                    // TODO: using fuzzy_indices could give us the char idx for match highlighting
-                    self.matcher
-                        .fuzzy_match(&text, pattern)
-                        .map(|score| (index, score))
-                }),
-        );
-        // matches.sort_unstable_by_key(|(_, score)| -score);
-        self.matches.sort_unstable_by_key(|(index, _score)| {
-            self.options[*index].sort_text(&self.editor_data)
-        });
+        // shortcut, if there isn't a pattern
+        if self.previous_pattern.is_empty() {
+            self.matches
+                .extend(self.options.iter().enumerate().map(|(o, _)| (o, 0)))
+        } else {
+            self.matches.extend(
+                self.options
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, option)| {
+                        let text = option.filter_text(&self.editor_data);
+                        // TODO: using fuzzy_indices could give us the char idx for match highlighting
+                        self.matcher
+                            .fuzzy_match(&text, &self.previous_pattern)
+                            .map(|score| (index, score))
+                    }),
+            );
+            // matches.sort_unstable_by_key(|(_, score)| -score);
+            self.matches.sort_unstable_by_key(|(index, _score)| {
+                self.options[*index].sort_text(&self.editor_data)
+            });
+        }
 
-        // reset cursor position
-        self.cursor = None;
         self.scroll = 0;
         self.recalculate = true;
+        // reset cursor position or recover position based on previous matched option
+        if let Some(prev_matched_option) = prev_matched_option {
+            self.cursor = self.matches.iter().enumerate().find_map(|(index, m)| {
+                if m.0 == prev_matched_option {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            self.adjust_scroll();
+        } else {
+            self.cursor = None;
+        }
+    }
+
+    pub fn score(&mut self, pattern: &str, reset_cursor: bool) {
+        if self.previous_pattern != pattern {
+            self.previous_pattern = pattern.to_owned();
+        }
+        self.re_score(reset_cursor);
+    }
+
+    pub fn add_options(&mut self, mut options: Vec<T>) {
+        self.options.append(&mut options);
+        self.re_score(false);
     }
 
     pub fn clear(&mut self) {
