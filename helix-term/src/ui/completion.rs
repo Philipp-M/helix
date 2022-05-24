@@ -15,8 +15,16 @@ use helix_view::{
 use crate::commands;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 
-use helix_lsp::{lsp, util};
-use lsp::CompletionItem;
+use helix_lsp::{lsp, util, OffsetEncoding};
+
+#[derive(Clone)]
+pub enum CompletionItem {
+    LSP {
+        language_server_id: usize,
+        item: lsp::CompletionItem,
+        offset_encoding: OffsetEncoding,
+    },
+}
 
 impl menu::Item for CompletionItem {
     type Data = ();
@@ -26,54 +34,63 @@ impl menu::Item for CompletionItem {
 
     #[inline]
     fn filter_text(&self, _data: &Self::Data) -> Cow<str> {
-        self.filter_text
-            .as_ref()
-            .unwrap_or(&self.label)
-            .as_str()
-            .into()
+        match self {
+            CompletionItem::LSP { item, .. } => item
+                .filter_text
+                .as_ref()
+                .unwrap_or(&item.label)
+                .as_str()
+                .into(),
+        }
     }
 
     fn label(&self, _data: &Self::Data) -> Spans {
-        self.label.as_str().into()
+        match self {
+            CompletionItem::LSP { item, .. } => item.label.as_str().into(),
+        }
     }
 
-    fn row(&self, _data: &Self::Data) -> menu::Row {
+    fn row(&self, data: &Self::Data) -> menu::Row {
         menu::Row::new(vec![
-            menu::Cell::from(self.label.as_str()),
-            menu::Cell::from(match self.kind {
-                Some(lsp::CompletionItemKind::TEXT) => "text",
-                Some(lsp::CompletionItemKind::METHOD) => "method",
-                Some(lsp::CompletionItemKind::FUNCTION) => "function",
-                Some(lsp::CompletionItemKind::CONSTRUCTOR) => "constructor",
-                Some(lsp::CompletionItemKind::FIELD) => "field",
-                Some(lsp::CompletionItemKind::VARIABLE) => "variable",
-                Some(lsp::CompletionItemKind::CLASS) => "class",
-                Some(lsp::CompletionItemKind::INTERFACE) => "interface",
-                Some(lsp::CompletionItemKind::MODULE) => "module",
-                Some(lsp::CompletionItemKind::PROPERTY) => "property",
-                Some(lsp::CompletionItemKind::UNIT) => "unit",
-                Some(lsp::CompletionItemKind::VALUE) => "value",
-                Some(lsp::CompletionItemKind::ENUM) => "enum",
-                Some(lsp::CompletionItemKind::KEYWORD) => "keyword",
-                Some(lsp::CompletionItemKind::SNIPPET) => "snippet",
-                Some(lsp::CompletionItemKind::COLOR) => "color",
-                Some(lsp::CompletionItemKind::FILE) => "file",
-                Some(lsp::CompletionItemKind::REFERENCE) => "reference",
-                Some(lsp::CompletionItemKind::FOLDER) => "folder",
-                Some(lsp::CompletionItemKind::ENUM_MEMBER) => "enum_member",
-                Some(lsp::CompletionItemKind::CONSTANT) => "constant",
-                Some(lsp::CompletionItemKind::STRUCT) => "struct",
-                Some(lsp::CompletionItemKind::EVENT) => "event",
-                Some(lsp::CompletionItemKind::OPERATOR) => "operator",
-                Some(lsp::CompletionItemKind::TYPE_PARAMETER) => "type_param",
-                Some(kind) => unimplemented!("{:?}", kind),
-                None => "",
-            }),
-            // self.detail.as_deref().unwrap_or("")
-            // self.label_details
-            //     .as_ref()
-            //     .or(self.detail())
-            //     .as_str(),
+            menu::Cell::from(self.label(data)),
+            match self {
+                CompletionItem::LSP { item, .. } => {
+                    menu::Cell::from(match item.kind {
+                        Some(lsp::CompletionItemKind::TEXT) => "text",
+                        Some(lsp::CompletionItemKind::METHOD) => "method",
+                        Some(lsp::CompletionItemKind::FUNCTION) => "function",
+                        Some(lsp::CompletionItemKind::CONSTRUCTOR) => "constructor",
+                        Some(lsp::CompletionItemKind::FIELD) => "field",
+                        Some(lsp::CompletionItemKind::VARIABLE) => "variable",
+                        Some(lsp::CompletionItemKind::CLASS) => "class",
+                        Some(lsp::CompletionItemKind::INTERFACE) => "interface",
+                        Some(lsp::CompletionItemKind::MODULE) => "module",
+                        Some(lsp::CompletionItemKind::PROPERTY) => "property",
+                        Some(lsp::CompletionItemKind::UNIT) => "unit",
+                        Some(lsp::CompletionItemKind::VALUE) => "value",
+                        Some(lsp::CompletionItemKind::ENUM) => "enum",
+                        Some(lsp::CompletionItemKind::KEYWORD) => "keyword",
+                        Some(lsp::CompletionItemKind::SNIPPET) => "snippet",
+                        Some(lsp::CompletionItemKind::COLOR) => "color",
+                        Some(lsp::CompletionItemKind::FILE) => "file",
+                        Some(lsp::CompletionItemKind::REFERENCE) => "reference",
+                        Some(lsp::CompletionItemKind::FOLDER) => "folder",
+                        Some(lsp::CompletionItemKind::ENUM_MEMBER) => "enum_member",
+                        Some(lsp::CompletionItemKind::CONSTANT) => "constant",
+                        Some(lsp::CompletionItemKind::STRUCT) => "struct",
+                        Some(lsp::CompletionItemKind::EVENT) => "event",
+                        Some(lsp::CompletionItemKind::OPERATOR) => "operator",
+                        Some(lsp::CompletionItemKind::TYPE_PARAMETER) => "type_param",
+                        Some(kind) => unimplemented!("{:?}", kind),
+                        None => "",
+                    })
+                    // self.detail.as_deref().unwrap_or("")
+                    // self.label_details
+                    //     .as_ref()
+                    //     .or(self.detail())
+                    //     .as_str(),
+                }
+            },
         ])
     }
 }
@@ -93,7 +110,6 @@ impl Completion {
     pub fn new(
         editor: &Editor,
         items: Vec<CompletionItem>,
-        offset_encoding: helix_lsp::OffsetEncoding,
         start_offset: usize,
         trigger_offset: usize,
     ) -> Self {
@@ -101,10 +117,17 @@ impl Completion {
             fn item_to_transaction(
                 doc: &Document,
                 item: &CompletionItem,
-                offset_encoding: helix_lsp::OffsetEncoding,
                 start_offset: usize,
                 trigger_offset: usize,
             ) -> Transaction {
+                // for now only LSP support
+                let (item, offset_encoding) = match item {
+                    CompletionItem::LSP {
+                        item,
+                        offset_encoding,
+                        ..
+                    } => (item, *offset_encoding),
+                };
                 let transaction = if let Some(edit) = &item.text_edit {
                     let edit = match edit {
                         lsp::CompletionTextEdit::Edit(edit) => edit.clone(),
@@ -154,13 +177,7 @@ impl Completion {
                     // always present here
                     let item = item.unwrap();
 
-                    let transaction = item_to_transaction(
-                        doc,
-                        item,
-                        offset_encoding,
-                        start_offset,
-                        trigger_offset,
-                    );
+                    let transaction = item_to_transaction(doc, item, start_offset, trigger_offset);
 
                     // initialize a savepoint
                     doc.savepoint();
@@ -175,13 +192,7 @@ impl Completion {
                     // always present here
                     let item = item.unwrap();
 
-                    let transaction = item_to_transaction(
-                        doc,
-                        item,
-                        offset_encoding,
-                        start_offset,
-                        trigger_offset,
-                    );
+                    let transaction = item_to_transaction(doc, item, start_offset, trigger_offset);
 
                     apply_transaction(&transaction, doc, view);
 
@@ -190,8 +201,16 @@ impl Completion {
                         changes: completion_changes(&transaction, trigger_offset),
                     });
 
+                    let (lsp_item, offset_encoding, language_server_id) = match item {
+                        CompletionItem::LSP {
+                            item,
+                            offset_encoding,
+                            language_server_id,
+                        } => (item, *offset_encoding, *language_server_id),
+                    };
+
                     // apply additional edits, mostly used to auto import unqualified types
-                    let resolved_item = if item
+                    let resolved_item = if lsp_item
                         .additional_text_edits
                         .as_ref()
                         .map(|edits| !edits.is_empty())
@@ -199,13 +218,17 @@ impl Completion {
                     {
                         None
                     } else {
-                        Self::resolve_completion_item(doc, item.clone())
+                        let language_server = editor
+                            .language_servers
+                            .get_by_id(language_server_id)
+                            .unwrap();
+                        Self::resolve_completion_item(language_server, lsp_item.clone())
                     };
 
                     if let Some(additional_edits) = resolved_item
                         .as_ref()
                         .and_then(|item| item.additional_text_edits.as_ref())
-                        .or(item.additional_text_edits.as_ref())
+                        .or(lsp_item.additional_text_edits.as_ref())
                     {
                         if !additional_edits.is_empty() {
                             let transaction = util::generate_transaction_from_edits(
@@ -233,11 +256,9 @@ impl Completion {
     }
 
     fn resolve_completion_item(
-        doc: &Document,
+        language_server: &helix_lsp::Client,
         completion_item: lsp::CompletionItem,
-    ) -> Option<CompletionItem> {
-        // TODO support multiple language servers instead of taking the first language server
-        let language_server = doc.language_servers().first().map(|l| *l)?;
+    ) -> Option<lsp::CompletionItem> {
         let completion_resolve_provider = language_server
             .capabilities()
             .completion_provider
@@ -256,6 +277,10 @@ impl Completion {
                 None
             }
         }
+    }
+
+    pub fn add_completion_items(&mut self, items: Vec<CompletionItem>) {
+        self.popup.contents_mut().add_options(items);
     }
 
     pub fn recompute_filter(&mut self, editor: &Editor) {
@@ -318,7 +343,7 @@ impl Component for Completion {
         self.popup.render(area, surface, cx);
 
         // if we have a selection, render a markdown popup on top/below with info
-        if let Some(option) = self.popup.contents().selection() {
+        if let Some(CompletionItem::LSP { item: option, .. }) = self.popup.contents().selection() {
             // need to render:
             // option.detail
             // ---
