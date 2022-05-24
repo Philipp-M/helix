@@ -3860,23 +3860,8 @@ pub fn completion(cx: &mut Context) {
 
     let (view, doc) = current!(cx.editor);
 
-    // TODO merge completion items of multiple language servers,
-    // instead of taking the first language server for completion
-    let language_server = match doc.language_servers().first() {
-        Some(language_server) => *language_server,
-        None => return,
-    };
-
-    let language_server_id = language_server.id();
-
-    let offset_encoding = language_server.offset_encoding();
     let text = doc.text().slice(..);
     let cursor = doc.selection(view.id).primary().cursor(text);
-
-    let pos = pos_to_lsp_pos(doc.text(), cursor, offset_encoding);
-
-    let future = language_server.completion(doc.identifier(), pos, None);
-
     let trigger_offset = cursor;
 
     // TODO: trigger_offset should be the cursor offset but we also need a starting offset from where we want to apply
@@ -3889,47 +3874,63 @@ pub fn completion(cx: &mut Context) {
     let start_offset = cursor.saturating_sub(offset);
     let prefix = text.slice(start_offset..cursor).to_string();
 
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<lsp::CompletionResponse>| {
-            if editor.mode != Mode::Insert {
-                // we're not in insert mode anymore
-                return;
-            }
+    let mut requests = Vec::new();
 
-            let mut items = match response {
-                Some(lsp::CompletionResponse::Array(items)) => items,
-                // TODO: do something with is_incomplete
-                Some(lsp::CompletionResponse::List(lsp::CompletionList {
-                    is_incomplete: _is_incomplete,
-                    items,
-                })) => items,
-                None => Vec::new(),
-            }
-            .into_iter()
-            .map(|item| CompletionItem::LSP {
-                language_server_id,
-                item,
-                offset_encoding,
-            })
-            .collect::<Vec<_>>();
+    for language_server in doc.language_servers() {
+        let language_server_id = language_server.id();
 
-            if !prefix.is_empty() {
-                items = items
-                    .into_iter()
-                    .filter(|item| item.filter_text(&()).starts_with(&prefix))
-                    .collect();
-            }
+        let offset_encoding = language_server.offset_encoding();
 
-            if items.is_empty() {
-                // editor.set_error("No completion available");
-                return;
-            }
-            let size = compositor.size();
-            let ui = compositor.find::<ui::EditorView>().unwrap();
-            ui.set_completion(editor, items, start_offset, trigger_offset, size);
-        },
-    );
+        let pos = pos_to_lsp_pos(doc.text(), cursor, offset_encoding);
+
+        let future = language_server.completion(doc.identifier(), pos, None);
+        requests.push((future, language_server_id, offset_encoding));
+    }
+
+    for (future, language_server_id, offset_encoding) in requests {
+        let prefix = prefix.clone();
+        cx.callback(
+            future,
+            move |editor, compositor, response: Option<lsp::CompletionResponse>| {
+                if editor.mode != Mode::Insert {
+                    // we're not in insert mode anymore
+                    return;
+                }
+
+                let mut items = match response {
+                    Some(lsp::CompletionResponse::Array(items)) => items,
+                    // TODO: do something with is_incomplete
+                    Some(lsp::CompletionResponse::List(lsp::CompletionList {
+                        is_incomplete: _is_incomplete,
+                        items,
+                    })) => items,
+                    None => Vec::new(),
+                }
+                .into_iter()
+                .map(|item| CompletionItem::LSP {
+                    language_server_id,
+                    item,
+                    offset_encoding,
+                })
+                .collect::<Vec<_>>();
+
+                if !prefix.is_empty() {
+                    items = items
+                        .into_iter()
+                        .filter(|item| item.filter_text(&()).starts_with(&prefix))
+                        .collect();
+                }
+
+                if items.is_empty() {
+                    // editor.set_error("No completion available");
+                    return;
+                }
+                let size = compositor.size();
+                let ui = compositor.find::<ui::EditorView>().unwrap();
+                ui.set_or_extend_completion(editor, items, start_offset, trigger_offset, size);
+            },
+        );
+    }
 }
 
 // comments

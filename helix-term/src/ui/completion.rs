@@ -279,6 +279,14 @@ impl Completion {
         }
     }
 
+    pub fn trigger_offset(&self) -> usize {
+        self.trigger_offset
+    }
+
+    pub fn start_offset(&self) -> usize {
+        self.start_offset
+    }
+
     pub fn add_completion_items(&mut self, items: Vec<CompletionItem>) {
         self.popup.contents_mut().add_options(items);
     }

@@ -1083,6 +1083,30 @@ impl EditorView {
         self.completion = Some(completion);
     }
 
+    pub fn set_or_extend_completion(
+        &mut self,
+        editor: &mut Editor,
+        items: Vec<CompletionItem>,
+        start_offset: usize,
+        trigger_offset: usize,
+        size: Rect,
+    ) {
+        match &mut self.completion {
+            Some(completion) => {
+                // cheap check, if the completion menu resulted of the same 'completion' trigger (e.g. by commands::completion)
+                // TODO test/check if this is enough/safe...
+                if start_offset == completion.start_offset()
+                    && completion.trigger_offset() == trigger_offset
+                {
+                    completion.add_completion_items(items)
+                } else {
+                    self.set_completion(editor, items, start_offset, trigger_offset, size)
+                }
+            }
+            None => self.set_completion(editor, items, start_offset, trigger_offset, size),
+        }
+    }
+
     pub fn clear_completion(&mut self, editor: &mut Editor) {
         self.completion = None;
 
