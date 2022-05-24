@@ -94,11 +94,11 @@ impl<T: Item> Menu<T> {
             recalculate: true,
         };
 
-        menu.re_score(true);
+        menu.recalculate_score(true);
         menu
     }
 
-    pub fn re_score(&mut self, reset_cursor: bool) {
+    pub fn recalculate_score(&mut self, reset_cursor: bool) {
         let prev_matched_option = if !reset_cursor {
             self.cursor
                 .and_then(|c| self.matches.get(c).map(|(index, _)| *index))
@@ -152,12 +152,12 @@ impl<T: Item> Menu<T> {
         if self.previous_pattern != pattern {
             self.previous_pattern = pattern.to_owned();
         }
-        self.re_score(reset_cursor);
+        self.recalculate_score(reset_cursor);
     }
 
     pub fn add_options(&mut self, mut options: Vec<T>) {
         self.options.append(&mut options);
-        self.re_score(false);
+        self.recalculate_score(false);
     }
 
     pub fn clear(&mut self) {
