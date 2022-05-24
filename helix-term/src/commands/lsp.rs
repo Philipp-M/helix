@@ -81,22 +81,23 @@ impl ui::menu::Item for lsp::Location {
     }
 }
 
-impl ui::menu::Item for lsp::SymbolInformation {
+impl ui::menu::Item for (lsp::SymbolInformation, OffsetEncoding) {
     /// Path to currently focussed document
     type Data = Option<lsp::Url>;
 
     fn label(&self, current_doc_path: &Self::Data) -> Spans {
-        if current_doc_path.as_ref() == Some(&self.location.uri) {
-            self.name.as_str().into()
+        let info = &self.0;
+        if current_doc_path.as_ref() == Some(&info.location.uri) {
+            info.name.as_str().into()
         } else {
-            match self.location.uri.to_file_path() {
+            match info.location.uri.to_file_path() {
                 Ok(path) => {
                     let relative_path = helix_core::path::get_relative_path(path.as_path())
                         .to_string_lossy()
                         .into_owned();
-                    format!("{} ({})", &self.name, relative_path).into()
+                    format!("{} ({})", &info.name, relative_path).into()
                 }
-                Err(_) => format!("{} ({})", &self.name, &self.location.uri).into(),
+                Err(_) => format!("{} ({})", &info.name, &info.location.uri).into(),
             }
         }
     }
@@ -211,20 +212,36 @@ fn jump_to_location(
     align_view(doc, view, Align::Center);
 }
 
+type SymbolPicker = FilePicker<(lsp::SymbolInformation, OffsetEncoding)>;
+
 fn sym_picker(
-    symbols: Vec<lsp::SymbolInformation>,
+    symbols: Vec<(lsp::SymbolInformation, OffsetEncoding)>,
     current_path: Option<lsp::Url>,
-    offset_encoding: OffsetEncoding,
-) -> FilePicker<lsp::SymbolInformation> {
+) -> SymbolPicker {
     // TODO: drop current_path comparison and instead use workspace: bool flag?
     FilePicker::new(
         symbols,
         current_path.clone(),
-        move |cx, symbol, action| {
-            let (view, doc) = current!(cx.editor);
-            push_jump(view, doc);
-
-            if current_path.as_ref() != Some(&symbol.location.uri) {
+        // move |(symbol, _offset_encoding)| {
+        //     if current_path.as_ref() == Some(&symbol.location.uri) {
+        //         symbol.name.as_str().into()
+        //     } else {
+        //         match symbol.location.uri.to_file_path() {
+        //             Ok(path) => {
+        //                 let relative_path = helix_core::path::get_relative_path(path.as_path())
+        //                     .to_string_lossy()
+        //                     .into_owned();
+        //                 format!("{} ({})", &symbol.name, relative_path).into()
+        //             }
+        //             Err(_) => format!("{} ({})", &symbol.name, &symbol.location.uri).into(),
+        //         }
+        //     }
+        // },
+        move |cx, (symbol, offset_encoding), action| {
+            if current_path.as_ref() == Some(&symbol.location.uri) {
+                let (view, doc) = current!(cx.editor);
+                push_jump(view, doc);
+            } else {
                 let uri = &symbol.location.uri;
                 let path = match uri.to_file_path() {
                     Ok(path) => path,
@@ -246,7 +263,7 @@ fn sym_picker(
             let (view, doc) = current!(cx.editor);
 
             if let Some(range) =
-                lsp_range_to_range(doc.text(), symbol.location.range, offset_encoding)
+                lsp_range_to_range(doc.text(), symbol.location.range, *offset_encoding)
             {
                 // we flip the range so that the cursor sits on the start of the symbol
                 // (for example start of the function).
@@ -254,7 +271,7 @@ fn sym_picker(
                 align_view(doc, view, Align::Center);
             }
         },
-        move |_editor, symbol| Some(location_to_file_location(&symbol.location)),
+        move |_editor, (symbol, _)| Some(location_to_file_location(&symbol.location)),
     )
     .truncate_start(false)
 }
@@ -354,53 +371,85 @@ pub fn symbol_picker(cx: &mut Context) {
     }
     let doc = doc!(cx.editor);
 
-    let language_server = language_server!(cx.editor, doc);
+    let mut requests = Vec::new();
     let current_url = doc.url();
-    let offset_encoding = language_server.offset_encoding();
 
-    let future = language_server.document_symbols(doc.identifier());
+    for ls in doc.language_servers() {
+        requests.push((ls.document_symbols(doc.identifier()), ls.offset_encoding()));
+    }
 
-    cx.callback(
-        future,
-        move |editor, compositor, response: Option<lsp::DocumentSymbolResponse>| {
-            if let Some(symbols) = response {
-                // lsp has two ways to represent symbols (flat/nested)
-                // convert the nested variant to flat, so that we have a homogeneous list
-                let symbols = match symbols {
-                    lsp::DocumentSymbolResponse::Flat(symbols) => symbols,
-                    lsp::DocumentSymbolResponse::Nested(symbols) => {
-                        let doc = doc!(editor);
-                        let mut flat_symbols = Vec::new();
-                        for symbol in symbols {
-                            nested_to_flat(&mut flat_symbols, &doc.identifier(), symbol)
+    // TODO if the symbol picker was closed before another lsp has sent its symbols,
+    // the symbol picker opens again... This could be solved by using a mutex similar as in code_action
+    for (future, offset_encoding) in requests {
+        let current_url = current_url.clone();
+
+        cx.callback(
+            future,
+            move |editor, compositor, response: Option<lsp::DocumentSymbolResponse>| {
+                if let Some(symbols) = response {
+                    // lsp has two ways to represent symbols (flat/nested)
+                    // convert the nested variant to flat, so that we have a homogeneous list
+                    let symbols = match symbols {
+                        lsp::DocumentSymbolResponse::Flat(symbols) => symbols,
+                        lsp::DocumentSymbolResponse::Nested(symbols) => {
+                            let doc = doc!(editor);
+                            let mut flat_symbols = Vec::new();
+                            for symbol in symbols {
+                                nested_to_flat(&mut flat_symbols, &doc.identifier(), symbol)
+                            }
+                            flat_symbols
                         }
-                        flat_symbols
                     }
-                };
+                    .into_iter()
+                    .map(|s| (s, offset_encoding))
+                    .collect();
 
-                let picker = sym_picker(symbols, current_url, offset_encoding);
-                compositor.push(Box::new(overlayed(picker)))
-            }
-        },
-    )
+                    let symbol_picker = compositor.find::<ui::Overlay<SymbolPicker>>();
+                    match symbol_picker {
+                        Some(picker) => picker.content.add_options(symbols),
+                        None => {
+                            let picker = overlayed(sym_picker(symbols, current_url));
+                            compositor.push(Box::new(picker));
+                        }
+                    }
+                }
+            },
+        )
+    }
 }
 
 pub fn workspace_symbol_picker(cx: &mut Context) {
     let doc = doc!(cx.editor);
     let current_url = doc.url();
-    let language_server = language_server!(cx.editor, doc);
-    let offset_encoding = language_server.offset_encoding();
-    let future = language_server.workspace_symbols("".to_string());
 
-    cx.callback(
-        future,
-        move |_editor, compositor, response: Option<Vec<lsp::SymbolInformation>>| {
-            if let Some(symbols) = response {
-                let picker = sym_picker(symbols, current_url, offset_encoding);
-                compositor.push(Box::new(overlayed(picker)))
-            }
-        },
-    )
+    let mut requests = Vec::new();
+
+    for ls in doc.language_servers() {
+        requests.push((ls.workspace_symbols("".to_string()), ls.offset_encoding()));
+    }
+
+    // TODO if the symbol picker was closed before another lsp has sent its symbols,
+    // the symbol picker opens again... This could be solved by using a mutex similar as in code_action
+    for (future, offset_encoding) in requests {
+        let current_url = current_url.clone();
+
+        cx.callback(
+            future,
+            move |_editor, compositor, response: Option<Vec<lsp::SymbolInformation>>| {
+                if let Some(symbols) = response {
+                    let symbols = symbols.into_iter().map(|s| (s, offset_encoding)).collect();
+                    let symbol_picker = compositor.find::<ui::Overlay<SymbolPicker>>();
+                    match symbol_picker {
+                        Some(picker) => picker.content.add_options(symbols),
+                        None => {
+                            let picker = overlayed(sym_picker(symbols, current_url));
+                            compositor.push(Box::new(picker));
+                        }
+                    }
+                }
+            },
+        )
+    }
 }
 
 pub fn diagnostics_picker(cx: &mut Context) {
