@@ -4,6 +4,7 @@
 
 To add a new language, you need to add a `[[language]]` entry to the
 `languages.toml` (see the [language configuration section]).
+A new language server can be added by extending the `[language-server]` table in the same file.
 
 When adding a new language or Language Server configuration for an existing
 language, run `cargo xtask docgen` to add the new configuration to the

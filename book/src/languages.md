@@ -39,8 +39,8 @@ injection-regex = "^mylang$"
 file-types = ["mylang", "myl"]
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-server = { command = "mylang-lsp", args = ["--stdio"] }
 formatter = { command = "mylang-formatter" , args = ["--stdin"] }
+language-servers = [ "mylang-lsp" ]
 ```
 
 These configuration keys are available:
@@ -48,6 +48,7 @@ These configuration keys are available:
 | Key                   | Description                                                   |
 | ----                  | -----------                                                   |
 | `name`                | The name of the language                                      |
+| `language-id`         | The language-id for language servers, checkout the table at [TextDocumentItem](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem) for the right id |
 | `scope`               | A string like `source.js` that identifies the language. Currently, we strive to match the scope names used by popular TextMate grammars and by the Linguist library. Usually `source.<name>` or `text.<name>` in case of markup languages |
 | `injection-regex`     | regex pattern that will be tested against a language name in order to determine whether this language should be used for a potential [language injection][treesitter-language-injection] site. |
 | `file-types`          | The filetypes of the language, for example `["yml", "yaml"]`. Extensions and full file names are supported.  |
@@ -57,32 +58,87 @@ These configuration keys are available:
 | `diagnostic-severity` | Minimal severity of diagnostic for it to be displayed. (Allowed values: `Error`, `Warning`, `Info`, `Hint`) |
 | `comment-token`       | The token to use as a comment-token                           |
 | `indent`              | The indent to use. Has sub keys `tab-width` and `unit`        |
-| `language-server`     | The Language Server to run. See the Language Server configuration section below. |
+| `language-servers`    | The Language Servers used for this language. See below for more information   |
 | `config`              | Language Server configuration                                 |
 | `grammar`             | The tree-sitter grammar to use (defaults to the value of `name`) |
 | `formatter`           | The formatter for the language, it will take precedence over the lsp when defined. The formatter must be able to take the original file as input from stdin and write the formatted file to stdout |
 | `max-line-length`     | Maximum line length. Used for the `:reflow` command           |
 
-### Language Server configuration
-
-The `language-server` field takes the following keys:
-
-| Key           | Description                                                           |
-| ---           | -----------                                                           |
-| `command`     | The name of the language server binary to execute. Binaries must be in `$PATH` |
-| `args`        | A list of arguments to pass to the language server binary             |
-| `timeout`     | The maximum time a request to the language server may take, in seconds. Defaults to `20` |
-| `language-id` | The language name to pass to the language server. Some language servers support multiple languages and use this field to determine which one is being served in a buffer |
-
-The top-level `config` field is used to configure the LSP initialization options. A `format`
-sub-table within `config` can be used to pass extra formatting options to
-[Document Formatting Requests](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/specification-3-16.md#document-formatting-request--leftwards_arrow_with_hook).
-For example with typescript:
+In case multiple language servers are specified, it's often useful to only enable/disable certain language-server features for these language servers.
+For example `efm-lsp-prettier` (see in the next section for an example configuration for typescript) is used only with a formatting command `prettier`
+but everything else should be handled by the `typescript-language-server` (configured by default)
+The language configuration for typescript could look like this:
 
 ```toml
 [[language]]
 name = "typescript"
-auto-format = true
+language-servers = [ { name = "efm-lsp-prettier", only-features = [ "format" ] }, "typescript-language-server" ]
+```
+
+or equivalent:
+
+```toml
+[[language]]
+name = "typescript"
+language-servers = [ { name = "typescript-language-server", except-features = [ "format" ] }, "efm-lsp-prettier" ]
+```
+
+Each requested LSP feature is priorized in the order of the `language-servers` array.
+For example the first `goto-definition` supported language server (in this case `typescript-language-server`) will be taken for the relevant LSP request (command `goto_definition`).
+If no `except-features` or `only-features` is given all features for the language server are enabled.
+
+The list of supported features are:
+
+- `format`
+- `goto-definition`
+- `goto-type-definition`
+- `goto-reference`
+- `goto-implementation`
+- `signature-help`
+- `hover`
+- `document-highlight`
+- `completion`
+- `code-action`
+- `document-symbols`
+- `workspace-symbols`
+- `diagnostics`
+- `rename-symbol`
+
+## Language Server configuration
+
+Language servers are configured separately in the table `language-server` in the same file as the languages [`languages.toml`][languages.toml]
+
+For example:
+
+```toml
+[langauge-server.mylang-lsp]
+command = "mylang-lsp"
+args = ["--stdio"]
+config = { provideFormatter = true }
+
+[language-server.efm-lsp-prettier]
+command = "efm-langserver"
+
+[language-server.efm-lsp-prettier.config]
+documentFormatting = true
+languages = { typescript = [ { formatCommand ="prettier --stdin-filepath ${INPUT}", formatStdin = true } ] }
+```
+
+These are the available options for a language server.
+
+| Key                   | Description                                                                              |
+| ----                  | -----------                                                                              |
+| `command`             | The name or path of the language server binary to execute. Binaries must be in `$PATH`   |
+| `args`                | A list of arguments to pass to the language server binary                                |
+| `config`              | LSP initialization options                               |
+| `timeout`             | The maximum time a request to the language server may take, in seconds. Defaults to `20` |
+
+A `format` sub-table within `config` can be used to pass extra formatting options to
+[Document Formatting Requests](https://github.com/microsoft/language-server-protocol/blob/gh-pages/_specifications/specification-3-16.md#document-formatting-request--leftwards_arrow_with_hook).
+For example with typescript:
+
+```toml
+[langauge-server.typescript-language-server]
 # pass format options according to https://github.com/typescript-language-server/typescript-language-server#workspacedidchangeconfiguration omitting the "[language].format." prefix.
 config = { format = { "semicolons" = "insert", "insertSpaceBeforeFunctionParenthesis" = true } }
 ```
