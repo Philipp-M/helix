@@ -28,6 +28,7 @@ use tokio::{
 #[derive(Debug)]
 pub struct Client {
     id: usize,
+    name: String,
     _process: Child,
     server_tx: UnboundedSender<Payload>,
     request_counter: AtomicU64,
@@ -41,13 +42,14 @@ pub struct Client {
 }
 
 impl Client {
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub fn start(
         cmd: &str,
         args: &[String],
         config: Option<Value>,
         root_markers: &[String],
         id: usize,
+        name: String,
         req_timeout: u64,
         doc_path: Option<&std::path::PathBuf>,
     ) -> Result<(Self, UnboundedReceiver<(usize, Call)>, Arc<Notify>)> {
@@ -97,6 +99,7 @@ impl Client {
 
         let client = Self {
             id,
+            name,
             _process: process,
             server_tx,
             request_counter: AtomicU64::new(0),
@@ -111,6 +114,10 @@ impl Client {
         };
 
         Ok((client, server_rx, initialize_notify))
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
     }
 
     pub fn id(&self) -> usize {

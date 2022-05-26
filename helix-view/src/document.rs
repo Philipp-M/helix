@@ -2,6 +2,7 @@ use anyhow::{anyhow, bail, Context, Error};
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
+use helix_core::syntax::{LanguageServerFeature, LanguageServerFeatureConfiguation};
 use helix_core::Range;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
@@ -466,8 +467,10 @@ impl Document {
 
         let text = self.text.clone();
         // finds first language server that supports formatting and then formats
-        let (offset_encoding, request) =
-            self.language_servers().iter().find_map(|language_server| {
+        let (offset_encoding, request) = self
+            .language_servers_with_feature(LanguageServerFeature::Format)
+            .iter()
+            .find_map(|language_server| {
                 let offset_encoding = language_server.offset_encoding();
                 let request = language_server.text_document_formatting(
                     self.identifier(),
@@ -983,6 +986,70 @@ impl Document {
         self.language_servers
             .iter()
             .filter_map(|l| if l.is_initialized() { Some(&**l) } else { None })
+            .collect()
+    }
+
+    pub fn language_server_supports_feature(
+        &self,
+        language_server: &helix_lsp::Client,
+        feature: LanguageServerFeature,
+    ) -> bool {
+        let language_config = match self.language_config() {
+            Some(language_config) => language_config,
+            None => return false,
+        };
+        language_config.language_servers.iter().any(|c| match c {
+            LanguageServerFeatureConfiguation::Simple(name) => name == language_server.name(),
+            LanguageServerFeatureConfiguation::Features {
+                only_features,
+                except_features,
+                name,
+            } => {
+                name == language_server.name()
+                    && (only_features.is_empty() || only_features.contains(&feature))
+                    && !except_features.contains(&feature)
+            }
+        })
+    }
+
+    pub fn language_servers_with_feature(
+        &self,
+        feature: LanguageServerFeature,
+    ) -> Vec<&helix_lsp::Client> {
+        let language_servers = self.language_servers();
+
+        let language_config = match self.language_config() {
+            Some(language_config) => language_config,
+            None => return Vec::new(),
+        };
+
+        // O(n^2) but since language_servers will be of very small length,
+        // I don't see the necessity to optimize
+        language_config
+            .language_servers
+            .iter()
+            .filter_map(|c| match c {
+                LanguageServerFeatureConfiguation::Simple(name) => language_servers
+                    .iter()
+                    .find(|ls| ls.name() == name)
+                    .copied(),
+                LanguageServerFeatureConfiguation::Features {
+                    only_features,
+                    except_features,
+                    name,
+                } => {
+                    if (only_features.is_empty() || only_features.contains(&feature))
+                        && !except_features.contains(&feature)
+                    {
+                        language_servers
+                            .iter()
+                            .find(|ls| ls.name() == name)
+                            .copied()
+                    } else {
+                        None
+                    }
+                }
+            })
             .collect()
     }
 

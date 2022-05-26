@@ -20,7 +20,9 @@ use helix_core::{
     object, pos_at_coords, pos_at_visual_coords,
     regex::{self, Regex, RegexBuilder},
     search::{self, CharMatcher},
-    selection, shellwords, surround, textobject,
+    selection, shellwords, surround,
+    syntax::LanguageServerFeature,
+    textobject,
     tree_sitter::Node,
     unicode::width::UnicodeWidthChar,
     visual_coords_at_pos, LineEnding, Position, Range, Rope, RopeGraphemes, RopeSlice, Selection,
@@ -2917,17 +2919,15 @@ pub mod insert {
         use helix_lsp::lsp;
         // if ch matches completion char, trigger completion
         let doc = doc_mut!(cx.editor);
-        let trigger_completion = doc.language_servers().iter().any(|language_server| {
-            let capabilities = language_server.capabilities();
+        let language_servers = doc.language_servers_with_feature(LanguageServerFeature::Completion);
+        let trigger_completion = language_servers.iter().any(|ls| {
+            let capabilities = ls.capabilities();
 
             // TODO: what if trigger is multiple chars long
-            match &capabilities.completion_provider {
-                Some(lsp::CompletionOptions {
+            matches!(&capabilities.completion_provider, Some(lsp::CompletionOptions {
                     trigger_characters: Some(triggers),
                     ..
-                }) => triggers.iter().any(|trigger| trigger.contains(ch)),
-                _ => false,
-            }
+                }) if triggers.iter().any(|trigger| trigger.contains(ch)))
         });
 
         if trigger_completion {
@@ -2940,11 +2940,14 @@ pub mod insert {
         use helix_lsp::lsp;
         // if ch matches signature_help char, trigger
         let doc = doc_mut!(cx.editor);
-        // The language_server!() macro is not used here since it will
-        // print an "LSP not active for current buffer" message on
-        // every keypress.
-        let is_trigger = doc.language_servers().iter().any(|language_server| {
-            let capabilities = language_server.capabilities();
+        // lsp doesn't tell us when to close the signature help, so we request
+        // the help information again after common close triggers which should
+        // return None, which in turn closes the popup.
+        let close_triggers = &[')', ';', '.'];
+        let language_servers =
+            doc.language_servers_with_feature(LanguageServerFeature::SignatureHelp);
+        let language_server_id = language_servers.iter().find_map(|ls| {
+            let capabilities = ls.capabilities();
 
             match capabilities {
                 lsp::ServerCapabilities {
@@ -2955,21 +2958,23 @@ pub mod insert {
                             ..
                         }),
                     ..
-                } => {
-                    // TODO: what if trigger is multiple chars long
-                    let is_trigger = triggers.iter().any(|trigger| trigger.contains(ch));
-                    // lsp doesn't tell us when to close the signature help, so we request
-                    // the help information again after common close triggers which should
-                    // return None, which in turn closes the popup.
-                    let close_triggers = &[')', ';', '.'];
-                    is_trigger || close_triggers.contains(&ch)
+                } if triggers.iter().any(|trigger| trigger.contains(ch))
+                    || close_triggers.contains(&ch) =>
+                {
+                    Some(ls.id())
                 }
-                _ => false,
+                _ if close_triggers.contains(&ch) => Some(ls.id()),
+                // TODO: what if trigger is multiple chars long
+                _ => None,
             }
         });
 
-        if is_trigger {
-            super::signature_help(cx);
+        if let Some(id) = language_server_id {
+            super::signature_help_impl_with_language_server_id(
+                cx,
+                id,
+                SignatureHelpInvoked::Automatic,
+            )
         }
     }
 
@@ -2983,7 +2988,7 @@ pub mod insert {
         Some(transaction)
     }
 
-    use helix_core::auto_pairs;
+    use helix_core::{auto_pairs, syntax::LanguageServerFeature};
 
     pub fn insert_char(cx: &mut Context, c: char) {
         let (view, doc) = current_ref!(cx.editor);
@@ -3702,7 +3707,10 @@ fn format_selections(cx: &mut Context) {
     // via lsp if available
     // else via tree-sitter indentation calculations
 
-    let language_server = match doc.language_servers().first() {
+    let language_server = match doc
+        .language_servers_with_feature(LanguageServerFeature::Format)
+        .first()
+    {
         Some(language_server) => *language_server,
         None => return,
     };
@@ -3876,7 +3884,7 @@ pub fn completion(cx: &mut Context) {
 
     let mut requests = Vec::new();
 
-    for language_server in doc.language_servers() {
+    for language_server in doc.language_servers_with_feature(LanguageServerFeature::Completion) {
         let language_server_id = language_server.id();
 
         let offset_encoding = language_server.offset_encoding();

@@ -57,8 +57,11 @@ fn default_timeout() -> u64 {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Configuration {
     pub language: Vec<LanguageConfiguration>,
+    #[serde(default)]
+    pub language_server: HashMap<String, LanguageServerConfiguration>,
 }
 
 // largely based on tree-sitter/cli/src/loader.rs
@@ -98,7 +101,7 @@ pub struct LanguageConfiguration {
     pub(crate) highlight_config: OnceCell<Option<Arc<HighlightConfiguration>>>,
     // tags_config OnceCell<> https://github.com/tree-sitter/tree-sitter/pull/583
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub language_servers: Vec<LanguageServerConfiguration>,
+    pub language_servers: Vec<LanguageServerFeatureConfiguation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indent: Option<IndentationConfiguration>,
 
@@ -117,6 +120,41 @@ pub struct LanguageConfiguration {
     pub auto_pairs: Option<AutoPairs>,
 
     pub rulers: Option<Vec<u16>>, // if set, override editor's rulers
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LanguageServerFeature {
+    Format,
+    GotoDefinition,
+    GotoTypeDefinition,
+    GotoReference,
+    GotoImplementation,
+    // Goto, use bitflags, combining previous Goto members?
+    SignatureHelp,
+    Hover,
+    DocumentHighlight,
+    Completion,
+    CodeAction,
+    DocumentSymbols,
+    WorkspaceSymbols,
+    // Symbols, use bitflags, see above?
+    Diagnostics,
+    RenameSymbol,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged, rename_all = "kebab-case", deny_unknown_fields)]
+pub enum LanguageServerFeatureConfiguation {
+    #[serde(rename_all = "kebab-case")]
+    Features {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        only_features: Vec<LanguageServerFeature>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        except_features: Vec<LanguageServerFeature>,
+        name: String,
+    },
+    Simple(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -435,6 +473,15 @@ impl LanguageConfiguration {
     }
 }
 
+impl LanguageServerFeatureConfiguation {
+    pub fn name(&self) -> &String {
+        match self {
+            LanguageServerFeatureConfiguation::Simple(name) => name,
+            LanguageServerFeatureConfiguation::Features { name, .. } => name,
+        }
+    }
+}
+
 // Expose loader as Lazy<> global since it's always static?
 
 #[derive(Debug)]
@@ -444,6 +491,8 @@ pub struct Loader {
     language_config_ids_by_file_type: HashMap<String, usize>, // Vec<usize>
     language_config_ids_by_shebang: HashMap<String, usize>,
 
+    language_server_configs: HashMap<String, LanguageServerConfiguration>,
+
     scopes: ArcSwap<Vec<String>>,
 }
 
@@ -451,6 +500,7 @@ impl Loader {
     pub fn new(config: Configuration) -> Self {
         let mut loader = Self {
             language_configs: Vec::new(),
+            language_server_configs: config.language_server,
             language_config_ids_by_file_type: HashMap::new(),
             language_config_ids_by_shebang: HashMap::new(),
             scopes: ArcSwap::from_pointee(Vec::new()),
@@ -549,6 +599,10 @@ impl Loader {
 
     pub fn language_configs(&self) -> impl Iterator<Item = &Arc<LanguageConfiguration>> {
         self.language_configs.iter()
+    }
+
+    pub fn language_server_configs(&self) -> &HashMap<String, LanguageServerConfiguration> {
+        &self.language_server_configs
     }
 
     pub fn set_scopes(&self, scopes: Vec<String>) {

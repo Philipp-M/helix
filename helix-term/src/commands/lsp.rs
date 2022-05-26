@@ -8,7 +8,7 @@ use tui::text::{Span, Spans};
 
 use super::{align_view, push_jump, Align, Context, Editor, Open};
 
-use helix_core::{path, Selection};
+use helix_core::{path, syntax::LanguageServerFeature, Selection};
 use helix_view::{apply_transaction, editor::Action, theme::Style};
 
 use crate::{
@@ -32,12 +32,12 @@ use std::{
 /// (instead of when the user explicitly does so via a keybind like
 /// `gd`) will spam the "LSP inactive" status message confusingly.
 #[macro_export]
-macro_rules! language_server {
-    ($editor:expr, $doc:expr) => {
-        match $doc.language_servers().first() {
+macro_rules! language_server_with_feature {
+    ($editor:expr, $doc:expr, $feature:expr) => {
+        match $doc.language_servers_with_feature($feature).first() {
             Some(language_server) => &**language_server,
             None => {
-                $editor.set_status("Language server not active for current buffer");
+                $editor.set_status("Language server not active for current buffer or no language server supports this feature");
                 return;
             }
         }
@@ -374,7 +374,7 @@ pub fn symbol_picker(cx: &mut Context) {
     let mut requests = Vec::new();
     let current_url = doc.url();
 
-    for ls in doc.language_servers() {
+    for ls in doc.language_servers_with_feature(LanguageServerFeature::DocumentSymbols) {
         requests.push((ls.document_symbols(doc.identifier()), ls.offset_encoding()));
     }
 
@@ -424,7 +424,7 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 
     let mut requests = Vec::new();
 
-    for ls in doc.language_servers() {
+    for ls in doc.language_servers_with_feature(LanguageServerFeature::WorkspaceSymbols) {
         requests.push((ls.workspace_symbols("".to_string()), ls.offset_encoding()));
     }
 
@@ -504,7 +504,7 @@ pub fn code_action(cx: &mut Context) {
 
     let mut requests = Vec::new();
 
-    for language_server in doc.language_servers() {
+    for language_server in doc.language_servers_with_feature(LanguageServerFeature::CodeAction) {
         let offset_encoding = language_server.offset_encoding();
         let range = range_to_lsp_range(doc.text(), selection_range, offset_encoding);
 
@@ -842,7 +842,8 @@ fn to_locations(definitions: Option<lsp::GotoDefinitionResponse>) -> Vec<lsp::Lo
 
 pub fn goto_definition(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoDefinition);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -860,7 +861,8 @@ pub fn goto_definition(cx: &mut Context) {
 
 pub fn goto_type_definition(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoTypeDefinition);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -878,7 +880,8 @@ pub fn goto_type_definition(cx: &mut Context) {
 
 pub fn goto_implementation(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoImplementation);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -896,7 +899,8 @@ pub fn goto_implementation(cx: &mut Context) {
 
 pub fn goto_reference(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::GotoReference);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -923,11 +927,14 @@ pub fn signature_help(cx: &mut Context) {
 }
 
 pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
-    let (view, doc) = current!(cx.editor);
+    let doc = doc!(cx.editor);
     let was_manually_invoked = invoked == SignatureHelpInvoked::Manual;
 
-    let language_server = match doc.language_servers().first() {
-        Some(language_server) => &**language_server,
+    let language_server_id = match doc
+        .language_servers_with_feature(LanguageServerFeature::SignatureHelp)
+        .first()
+    {
+        Some(language_server) => language_server.id(),
         None => {
             // Do not show the message if signature help was invoked
             // automatically on backspace, trigger characters, etc.
@@ -938,6 +945,17 @@ pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
             return;
         }
     };
+    signature_help_impl_with_language_server_id(cx, language_server_id, invoked);
+}
+
+pub fn signature_help_impl_with_language_server_id(
+    cx: &mut Context,
+    language_server_id: usize,
+    invoked: SignatureHelpInvoked,
+) {
+    let was_manually_invoked = invoked == SignatureHelpInvoked::Manual;
+    let (view, doc) = current!(cx.editor);
+    let language_server = language_server_by_id!(cx.editor, language_server_id);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -1030,7 +1048,8 @@ pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
 
 pub fn hover(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::Hover);
     let offset_encoding = language_server.offset_encoding();
 
     // TODO: factor out a doc.position_identifier() that returns lsp::TextDocumentPositionIdentifier
@@ -1102,7 +1121,8 @@ pub fn rename_symbol(cx: &mut Context) {
             }
 
             let (view, doc) = current!(cx.editor);
-            let language_server = language_server!(cx.editor, doc);
+            let language_server =
+                language_server_with_feature!(cx.editor, doc, LanguageServerFeature::RenameSymbol);
             let offset_encoding = language_server.offset_encoding();
 
             let pos = doc.position(view.id, offset_encoding);
@@ -1118,7 +1138,8 @@ pub fn rename_symbol(cx: &mut Context) {
 
 pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
     let (view, doc) = current!(cx.editor);
-    let language_server = language_server!(cx.editor, doc);
+    let language_server =
+        language_server_with_feature!(cx.editor, doc, LanguageServerFeature::DocumentHighlight);
     let offset_encoding = language_server.offset_encoding();
 
     let pos = doc.position(view.id, offset_encoding);
@@ -1133,8 +1154,6 @@ pub fn select_references_to_symbol_under_cursor(cx: &mut Context) {
                 _ => return,
             };
             let (view, doc) = current!(editor);
-            let language_server = language_server!(editor, doc);
-            let offset_encoding = language_server.offset_encoding();
             let text = doc.text();
             let pos = doc.selection(view.id).primary().head;
 

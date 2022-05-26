@@ -540,6 +540,19 @@ impl Application {
                         if let Some(doc) = doc {
                             let lang_conf = doc.language_config();
                             let text = doc.text();
+                            let language_server = doc
+                                .language_servers()
+                                .iter()
+                                .find(|l| l.id() == server_id)
+                                .copied()
+                                .unwrap();
+
+                            if !doc.language_server_supports_feature(
+                                language_server,
+                                syntax::LanguageServerFeature::Diagnostics,
+                            ) {
+                                return;
+                            }
 
                             let diagnostics = params
                                 .diagnostics
@@ -603,13 +616,18 @@ impl Application {
                                     };
 
                                     let tags = if let Some(ref tags) = diagnostic.tags {
-                                        let new_tags = tags.iter().filter_map(|tag| {
-                                            match *tag {
-                                                lsp::DiagnosticTag::DEPRECATED => Some(DiagnosticTag::Deprecated),
-                                                lsp::DiagnosticTag::UNNECESSARY => Some(DiagnosticTag::Unnecessary),
-                                                _ => None
-                                            }
-                                        }).collect();
+                                        let new_tags = tags
+                                            .iter()
+                                            .filter_map(|tag| match *tag {
+                                                lsp::DiagnosticTag::DEPRECATED => {
+                                                    Some(DiagnosticTag::Deprecated)
+                                                }
+                                                lsp::DiagnosticTag::UNNECESSARY => {
+                                                    Some(DiagnosticTag::Unnecessary)
+                                                }
+                                                _ => None,
+                                            })
+                                            .collect();
 
                                         new_tags
                                     } else {
@@ -623,7 +641,7 @@ impl Application {
                                         severity,
                                         code,
                                         tags,
-                                        source: diagnostic.source.clone()
+                                        source: diagnostic.source.clone(),
                                     })
                                 })
                                 .collect();
