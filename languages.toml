@@ -349,12 +349,13 @@ source = { git = "https://github.com/omertuc/tree-sitter-go-work", rev = "6dd9dd
 name = "javascript"
 scope = "source.js"
 injection-regex = "(js|javascript)"
+language-id = "javascript"
 file-types = ["js", "mjs", "cjs"]
 shebangs = ["node"]
 roots = []
 comment-token = "//"
 # TODO: highlights-params
-language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "javascript" }]
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [language.debugger]
@@ -377,10 +378,11 @@ source = { git = "https://github.com/tree-sitter/tree-sitter-javascript", rev = 
 name = "jsx"
 scope = "source.jsx"
 injection-regex = "jsx"
+language-id = "javascriptreact"
 file-types = ["jsx"]
 roots = []
 comment-token = "//"
-language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "javascriptreact" }]
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 grammar = "javascript"
 
@@ -388,11 +390,12 @@ grammar = "javascript"
 name = "typescript"
 scope = "source.ts"
 injection-regex = "(ts|typescript)"
+language-id = "typescript"
 file-types = ["ts"]
 shebangs = []
 roots = []
 # TODO: highlights-params
-language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "typescript"}]
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -403,10 +406,11 @@ source = { git = "https://github.com/tree-sitter/tree-sitter-typescript", rev = 
 name = "tsx"
 scope = "source.tsx"
 injection-regex = "(tsx)" # |typescript
+language-id = "typescriptreact"
 file-types = ["tsx"]
 roots = []
 # TODO: highlights-params
-language-servers = [{ command = "typescript-language-server", args = ["--stdio"], language-id = "typescriptreact" }]
+language-servers = [{ command = "typescript-language-server", args = ["--stdio"] }]
 indent = { tab-width = 2, unit = "  " }
 
 [[grammar]]
@@ -1178,11 +1182,12 @@ source = { git = "https://github.com/fwcd/tree-sitter-kotlin", rev = "a4f71eb9b8
 name = "hcl"
 scope = "source.hcl"
 injection-regex = "(hcl|tf|nomad)"
+language-id = "terraform"
 file-types = ["hcl", "tf", "nomad"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-servers = [{ command = "terraform-ls", args = ["serve"], language-id = "terraform" }]
+language-servers = [{ command = "terraform-ls", args = ["serve"] }]
 auto-format = true
 
 [[grammar]]
@@ -1192,11 +1197,12 @@ source = { git = "https://github.com/MichaHoffmann/tree-sitter-hcl", rev = "3cb7
 [[language]]
 name = "tfvars"
 scope = "source.tfvars"
+language-id = "terraform-vars"
 file-types = ["tfvars"]
 roots = []
 comment-token = "#"
 indent = { tab-width = 2, unit = "  " }
-language-servers = [{ command = "terraform-ls", args = ["serve"], language-id = "terraform-vars" }]
+language-servers = [{ command = "terraform-ls", args = ["serve"] }]
 auto-format = true
 grammar = "hcl"
 

@@ -959,15 +959,12 @@ impl Document {
             .map(|language| language.language_id.as_str())
     }
 
-    /// Language ID for the document. Either the `language-id` from the
-    /// first `language-server` configuration, or the document language if no
-    /// `language-id` has been specified.
+    /// Language ID for the document. Either the `language-id`,
+    /// or the document language name if no `language-id` has been specified.
     pub fn language_id(&self) -> Option<&str> {
-        // TODO is it safe to get the language_id from the first language server that defines it?
         self.language_config()?
-            .language_servers
-            .iter()
-            .find_map(|lsp_config| lsp_config.language_id.as_deref())
+            .language_server_language_id
+            .as_deref()
             .or_else(|| self.language_name())
     }
 

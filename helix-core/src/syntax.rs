@@ -66,7 +66,10 @@ pub struct Configuration {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct LanguageConfiguration {
     #[serde(rename = "name")]
-    pub language_id: String, // c-sharp, rust
+    pub language_id: String, // c-sharp, rust, tsx
+    #[serde(rename = "language-id")]
+    // see the table under https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem
+    pub language_server_language_id: Option<String>, // csharp, rust, typescriptreact, for the language-server
     pub scope: String,           // source.rust
     pub file_types: Vec<String>, // filename ends_with? <Gemfile, rb, etc>
     #[serde(default)]
@@ -129,7 +132,6 @@ pub struct LanguageServerConfiguration {
 
     #[serde(default = "default_timeout")]
     pub timeout: u64,
-    pub language_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
