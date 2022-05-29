@@ -1091,19 +1091,16 @@ impl EditorView {
         trigger_offset: usize,
         size: Rect,
     ) {
+        // cheap check, if the completion menu resulted of the same 'completion' trigger (e.g. by commands::completion)
+        // TODO test/check if this is enough/safe...
         match &mut self.completion {
-            Some(completion) => {
-                // cheap check, if the completion menu resulted of the same 'completion' trigger (e.g. by commands::completion)
-                // TODO test/check if this is enough/safe...
+            Some(completion)
                 if start_offset == completion.start_offset()
-                    && completion.trigger_offset() == trigger_offset
-                {
-                    completion.add_completion_items(items)
-                } else {
-                    self.set_completion(editor, items, start_offset, trigger_offset, size)
-                }
+                    && completion.trigger_offset() == trigger_offset =>
+            {
+                completion.add_completion_items(items)
             }
-            None => self.set_completion(editor, items, start_offset, trigger_offset, size),
+            _ => self.set_completion(editor, items, start_offset, trigger_offset, size),
         }
     }
 
