@@ -4,6 +4,8 @@ use tui::buffer::Buffer as Surface;
 use tui::text::Spans;
 
 use std::borrow::Cow;
+use std::fs::Permissions;
+use std::path::PathBuf;
 
 use helix_core::{Change, Transaction};
 use helix_view::{
@@ -17,12 +19,25 @@ use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 
 use helix_lsp::{lsp, util, OffsetEncoding};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
+pub enum PathType {
+    Dir,
+    File,
+    Symlink,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
 pub enum CompletionItem {
     LSP {
         language_server_id: usize,
-        item: lsp::CompletionItem,
+        item: Box<lsp::CompletionItem>, // TODO really Box here (performance, but clippy bleats)?
         offset_encoding: OffsetEncoding,
+    },
+    Path {
+        path: PathBuf,
+        permissions: Permissions,
+        path_type: PathType,
     },
 }
 
@@ -41,12 +56,24 @@ impl menu::Item for CompletionItem {
                 .unwrap_or(&item.label)
                 .as_str()
                 .into(),
+            CompletionItem::Path { path, .. } => path
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default()
+                .into(),
         }
     }
 
     fn label(&self, _data: &Self::Data) -> Spans {
         match self {
             CompletionItem::LSP { item, .. } => item.label.as_str().into(),
+            CompletionItem::Path { path, .. } => path
+                .file_name()
+                .unwrap_or_default()
+                .to_str()
+                .unwrap_or_default()
+                .into(),
         }
     }
 
@@ -83,6 +110,15 @@ impl menu::Item for CompletionItem {
                     Some(kind) => unimplemented!("{:?}", kind),
                     None => "",
                 }),
+                CompletionItem::Path { path_type, .. } => menu::Cell::from({
+                    // TODO probably check permissions/or (coloring maybe)
+                    match path_type {
+                        PathType::Dir => "dir",
+                        PathType::File => "file",
+                        PathType::Symlink => "symlink",
+                        PathType::Unknown => "unknown",
+                    }
+                }),
             },
         ])
     }
@@ -114,39 +150,50 @@ impl Completion {
                 trigger_offset: usize,
             ) -> Transaction {
                 // for now only LSP support
-                let (item, offset_encoding) = match item {
+                match item {
                     CompletionItem::LSP {
                         item,
                         offset_encoding,
                         ..
-                    } => (item, *offset_encoding),
-                };
-                let transaction = if let Some(edit) = &item.text_edit {
-                    let edit = match edit {
-                        lsp::CompletionTextEdit::Edit(edit) => edit.clone(),
-                        lsp::CompletionTextEdit::InsertAndReplace(item) => {
-                            unimplemented!("completion: insert_and_replace {:?}", item)
-                        }
-                    };
+                    } => {
+                        let transaction = if let Some(edit) = &item.text_edit {
+                            let edit = match edit {
+                                lsp::CompletionTextEdit::Edit(edit) => edit.clone(),
+                                lsp::CompletionTextEdit::InsertAndReplace(item) => {
+                                    unimplemented!("completion: insert_and_replace {:?}", item)
+                                }
+                            };
 
-                    util::generate_transaction_from_edits(
-                        doc.text(),
-                        vec![edit],
-                        offset_encoding, // TODO: should probably transcode in Client
-                    )
-                } else {
-                    let text = item.insert_text.as_ref().unwrap_or(&item.label);
-                    // Some LSPs just give you an insertText with no offset ¯\_(ツ)_/¯
-                    // in these cases we need to check for a common prefix and remove it
-                    let prefix = Cow::from(doc.text().slice(start_offset..trigger_offset));
-                    let text = text.trim_start_matches::<&str>(&prefix);
-                    Transaction::change(
-                        doc.text(),
-                        vec![(trigger_offset, trigger_offset, Some(text.into()))].into_iter(),
-                    )
-                };
+                            util::generate_transaction_from_edits(
+                                doc.text(),
+                                vec![edit],
+                                *offset_encoding, // TODO: should probably transcode in Client
+                            )
+                        } else {
+                            let text = item.insert_text.as_ref().unwrap_or(&item.label);
+                            // Some LSPs just give you an insertText with no offset ¯\_(ツ)_/¯
+                            // in these cases we need to check for a common prefix and remove it
+                            let prefix = Cow::from(doc.text().slice(start_offset..trigger_offset));
+                            let text = text.trim_start_matches::<&str>(&prefix);
+                            Transaction::change(
+                                doc.text(),
+                                vec![(trigger_offset, trigger_offset, Some(text.into()))]
+                                    .into_iter(),
+                            )
+                        };
 
-                transaction
+                        transaction
+                    }
+                    CompletionItem::Path { path, .. } => {
+                        let path_head = path.file_name().unwrap().to_string_lossy();
+                        let prefix = Cow::from(doc.text().slice(start_offset..trigger_offset));
+                        let text = path_head.trim_start_matches::<&str>(&prefix);
+                        Transaction::change(
+                            doc.text(),
+                            vec![(trigger_offset, trigger_offset, Some(text.into()))].into_iter(),
+                        )
+                    }
+                }
             }
 
             fn completion_changes(transaction: &Transaction, trigger_offset: usize) -> Vec<Change> {
@@ -194,42 +241,41 @@ impl Completion {
                         changes: completion_changes(&transaction, trigger_offset),
                     });
 
-                    let (lsp_item, offset_encoding, language_server_id) = match item {
-                        CompletionItem::LSP {
-                            item,
-                            offset_encoding,
-                            language_server_id,
-                        } => (item, *offset_encoding, *language_server_id),
-                    };
-
-                    // apply additional edits, mostly used to auto import unqualified types
-                    let resolved_item = if lsp_item
-                        .additional_text_edits
-                        .as_ref()
-                        .map(|edits| !edits.is_empty())
-                        .unwrap_or(false)
+                    if let CompletionItem::LSP {
+                        item,
+                        offset_encoding,
+                        language_server_id,
+                    } = item
                     {
-                        None
-                    } else {
-                        let language_server = editor
-                            .language_servers
-                            .get_by_id(language_server_id)
-                            .unwrap();
-                        Self::resolve_completion_item(language_server, lsp_item.clone())
-                    };
+                        // apply additional edits, mostly used to auto import unqualified types
+                        let resolved_item = if item
+                            .additional_text_edits
+                            .as_ref()
+                            .map(|edits| !edits.is_empty())
+                            .unwrap_or(false)
+                        {
+                            None
+                        } else {
+                            let language_server = editor
+                                .language_servers
+                                .get_by_id(*language_server_id)
+                                .unwrap();
+                            Self::resolve_completion_item(language_server, *item.clone())
+                        };
 
-                    if let Some(additional_edits) = resolved_item
-                        .as_ref()
-                        .and_then(|item| item.additional_text_edits.as_ref())
-                        .or(lsp_item.additional_text_edits.as_ref())
-                    {
-                        if !additional_edits.is_empty() {
-                            let transaction = util::generate_transaction_from_edits(
-                                doc.text(),
-                                additional_edits.clone(),
-                                offset_encoding, // TODO: should probably transcode in Client
-                            );
-                            apply_transaction(&transaction, doc, view);
+                        if let Some(additional_edits) = resolved_item
+                            .as_ref()
+                            .and_then(|item| item.additional_text_edits.as_ref())
+                            .or(item.additional_text_edits.as_ref())
+                        {
+                            if !additional_edits.is_empty() {
+                                let transaction = util::generate_transaction_from_edits(
+                                    doc.text(),
+                                    additional_edits.clone(),
+                                    *offset_encoding, // TODO: should probably transcode in Client
+                                );
+                                apply_transaction(&transaction, doc, view);
+                            }
                         }
                     }
                 }
@@ -342,6 +388,8 @@ impl Component for Completion {
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         self.popup.render(area, surface, cx);
+
+        // TODO show file contents for CompletionItem::Path
 
         // if we have a selection, render a markdown popup on top/below with info
         if let Some(CompletionItem::LSP { item: option, .. }) = self.popup.contents().selection() {
