@@ -3962,7 +3962,7 @@ pub fn completion_path(cx: &mut Context) {
     let line_until_cursor = text.slice(begin_line..cursor).to_string();
     // TODO find a good regex for most use cases (especially Windows, which is not yet covered...)
     // currently only one path match per line is possible in unix
-    static PATH_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"((?:/|\./).*)$").unwrap());
+    static PATH_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"((?:\.{0,2}/)+.*)$").unwrap());
 
     // TODO: trigger_offset should be the cursor offset but we also need a starting offset from where we want to apply
     // completion filtering. For example logger.te| should filter the initial suggestion list with "te".
