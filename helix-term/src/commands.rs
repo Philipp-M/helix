@@ -2936,15 +2936,16 @@ pub mod insert {
             })
             .collect::<Vec<_>>();
 
-        if !trigger_completion_ls_ids.is_empty() || ch == '/' {
+        if !trigger_completion_ls_ids.is_empty() {
             cx.editor.clear_idle_timer();
-            // TODO path for windows
-            if ch == '/' {
-                super::completion_path(cx)
-            }
             for id in trigger_completion_ls_ids {
                 super::completion_lsp(cx, id)
             }
+        }
+        // TODO path for windows
+        if ch == '/' && cx.editor.config().path_completion {
+            cx.editor.clear_idle_timer();
+            super::completion_path(cx)
         }
     }
 
@@ -4047,7 +4048,9 @@ pub fn completion(cx: &mut Context) {
         completion_lsp(cx, id)
     }
 
-    completion_path(cx);
+    if cx.editor.config().path_completion {
+        completion_path(cx);
+    }
 }
 
 // comments
