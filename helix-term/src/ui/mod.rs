@@ -15,7 +15,7 @@ mod text;
 
 use crate::compositor::{Component, Compositor};
 use crate::job;
-pub use completion::{Completion, CompletionItem, PathType};
+pub use completion::{Completion, CompletionItem, PathType, PATH_REGEX};
 pub use editor::EditorView;
 pub use markdown::Markdown;
 pub use menu::Menu;

@@ -3961,9 +3961,6 @@ pub fn completion_path(cx: &mut Context) {
     let cur_line = text.char_to_line(cursor);
     let begin_line = text.line_to_char(cur_line);
     let line_until_cursor = text.slice(begin_line..cursor).to_string();
-    // TODO find a good regex for most use cases (especially Windows, which is not yet covered...)
-    // currently only one path match per line is possible in unix
-    static PATH_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"((?:\.{0,2}/)+.*)$").unwrap());
 
     // TODO: trigger_offset should be the cursor offset but we also need a starting offset from where we want to apply
     // completion filtering. For example logger.te| should filter the initial suggestion list with "te".
@@ -3983,33 +3980,72 @@ pub fn completion_path(cx: &mut Context) {
                     // we're not in insert mode anymore
                     return;
                 }
-                // read dir for a possibly matched path
-                let items = PATH_REGEX
+                let doc = doc!(editor);
+
+                // TODO async path completion (for this probably the whole completion system has to be reworked to be async without producing race conditions)
+                let items = ui::PATH_REGEX
                     .find(&line_until_cursor)
-                    .and_then(|m| {
-                        let mut path = PathBuf::from(m.as_str());
-                        if path.starts_with(".") {
-                            path = std::env::current_dir().unwrap().join(path);
+                    .and_then(|matched_path| {
+                        let matched_path = matched_path.as_str();
+                        let mut path = PathBuf::from(matched_path);
+                        if path.is_relative() {
+                            if let Some(doc_path) = doc.path().and_then(|dp| dp.parent()) {
+                                path = doc_path.join(path);
+                            }
                         }
-                        std::fs::read_dir(path).ok().map(|rd| {
-                            rd.filter_map(|re| re.ok())
-                                .filter_map(|re| {
-                                    re.metadata().ok().map(|m| CompletionItem::Path {
-                                        path: re.path(),
-                                        permissions: m.permissions(),
-                                        path_type: if m.is_file() {
+                        let ends_with_slash = match matched_path.chars().last() {
+                            Some('/') => true, // TODO support Windows
+                            None => return Some(vec![]),
+                            _ => false,
+                        };
+                        // check if there are chars after the last slash, and if these chars represent a directory
+                        let (dir_path, typed_file_name) = match std::fs::metadata(path.clone()).ok()
+                        {
+                            Some(m) if m.is_dir() && ends_with_slash => {
+                                (Some(path.as_path()), None)
+                            }
+                            _ if !ends_with_slash => {
+                                (path.parent(), path.file_name().and_then(|f| f.to_str()))
+                            }
+                            _ => return Some(vec![]),
+                        };
+                        // read dir for a possibly matched path
+                        dir_path
+                            .and_then(|path| std::fs::read_dir(path).ok())
+                            .map(|read_dir| {
+                                read_dir
+                                    .filter_map(|dir_entry| dir_entry.ok())
+                                    .filter_map(|dir_entry| {
+                                        let path = dir_entry.path();
+                                        // check if <chars> in <path>/<chars><cursor> matches the start of the filename
+                                        let filename_starts_with_prefix = match (
+                                            path.file_name().and_then(|f| f.to_str()),
+                                            typed_file_name,
+                                        ) {
+                                            (Some(re_stem), Some(t)) => re_stem.starts_with(t),
+                                            _ => true,
+                                        };
+                                        if filename_starts_with_prefix {
+                                            dir_entry.metadata().ok().map(|md| (path, md))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .map(|(path, md)| CompletionItem::Path {
+                                        path,
+                                        permissions: md.permissions(),
+                                        path_type: if md.is_file() {
                                             PathType::File
-                                        } else if m.is_dir() {
+                                        } else if md.is_dir() {
                                             PathType::Dir
-                                        } else if m.is_symlink() {
+                                        } else if md.is_symlink() {
                                             PathType::Symlink
                                         } else {
                                             PathType::Unknown
                                         },
                                     })
-                                })
-                                .collect::<Vec<_>>()
-                        })
+                                    .collect::<Vec<_>>()
+                            })
                     })
                     .unwrap_or_default();
 

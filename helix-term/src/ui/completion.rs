@@ -1,5 +1,7 @@
 use crate::compositor::{Component, Context, Event, EventResult};
+use helix_core::regex::Regex;
 use helix_view::{apply_transaction, editor::CompleteAction};
+use once_cell::sync::Lazy;
 use tui::buffer::Buffer as Surface;
 use tui::text::Spans;
 
@@ -18,6 +20,10 @@ use crate::commands;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
 
 use helix_lsp::{lsp, util, OffsetEncoding};
+
+// TODO find a good regex for most use cases (especially Windows, which is not yet covered...)
+// currently only one path match per line is possible in unix
+pub static PATH_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"((?:\.{0,2}/)+.*)$").unwrap());
 
 #[derive(Debug, Clone)]
 pub enum PathType {
@@ -113,7 +119,7 @@ impl menu::Item for CompletionItem {
                 CompletionItem::Path { path_type, .. } => menu::Cell::from({
                     // TODO probably check permissions/or (coloring maybe)
                     match path_type {
-                        PathType::Dir => "dir",
+                        PathType::Dir => "folder",
                         PathType::File => "file",
                         PathType::Symlink => "symlink",
                         PathType::Unknown => "unknown",
@@ -185,8 +191,23 @@ impl Completion {
                         transaction
                     }
                     CompletionItem::Path { path, .. } => {
+                        let text = doc.text().slice(..);
+                        let cur_line = text.char_to_line(trigger_offset);
+                        let begin_line = text.line_to_char(cur_line);
                         let path_head = path.file_name().unwrap().to_string_lossy();
-                        let prefix = Cow::from(doc.text().slice(start_offset..trigger_offset));
+                        let line_until_trigger_offset =
+                            Cow::from(doc.text().slice(begin_line..trigger_offset));
+                        let mat = PATH_REGEX.find(&line_until_trigger_offset).unwrap();
+                        let path = PathBuf::from(mat.as_str());
+                        let mut prefix = path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        // TODO support Windows
+                        if path.to_str().map(|p| p.ends_with('/')).unwrap_or_default() {
+                            prefix += "/";
+                        }
                         let text = path_head.trim_start_matches::<&str>(&prefix);
                         Transaction::change(
                             doc.text(),
