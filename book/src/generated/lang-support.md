@@ -51,7 +51,7 @@
 | haskell | ✓ |  |  |  | `haskell-language-server-wrapper` |
 | hcl | ✓ |  | ✓ |  | `terraform-ls` |
 | heex | ✓ | ✓ |  |  |  |
-| html | ✓ |  |  |  | `vscode-html-language-server` |
+| html | ✓ |  |  | ✓ | `vscode-html-language-server` |
 | idris |  |  |  |  | `idris2-lsp` |
 | iex | ✓ |  |  |  |  |
 | ini | ✓ |  |  |  |  |
