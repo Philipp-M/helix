@@ -4,7 +4,7 @@ use crossterm::{
 };
 use helix_core::{
     config::{default_syntax_loader, user_syntax_loader},
-    syntax::LanguageServerFeatureConfiguation,
+    syntax::LanguageServerFeatureConfiguration,
 };
 use helix_loader::grammar::load_runtime_file;
 use helix_view::clipboard::get_clipboard_provider;
@@ -185,8 +185,8 @@ pub fn languages_all() -> std::io::Result<()> {
 
         let lsp = lang.language_servers.first().and_then(|lsp| {
             let name = match lsp {
-                LanguageServerFeatureConfiguation::Simple(name) => name,
-                LanguageServerFeatureConfiguation::Features { name, .. } => name,
+                LanguageServerFeatureConfiguration::Simple(name) => name,
+                LanguageServerFeatureConfiguration::Features { name, .. } => name,
             };
             syn_loader_conf
                 .language_server
@@ -266,8 +266,8 @@ pub fn language(lang_str: String) -> std::io::Result<()> {
         "language server",
         lang.language_servers.first().and_then(|lsp| {
             let name = match lsp {
-                LanguageServerFeatureConfiguation::Simple(name) => name,
-                LanguageServerFeatureConfiguation::Features { name, .. } => name,
+                LanguageServerFeatureConfiguration::Simple(name) => name,
+                LanguageServerFeatureConfiguration::Features { name, .. } => name,
             };
             syn_loader_conf
                 .language_server

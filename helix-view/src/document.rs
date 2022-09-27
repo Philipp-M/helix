@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Error};
 use futures_util::future::BoxFuture;
 use futures_util::FutureExt;
 use helix_core::auto_pairs::AutoPairs;
-use helix_core::syntax::{LanguageServerFeature, LanguageServerFeatureConfiguation};
+use helix_core::syntax::{LanguageServerFeature, LanguageServerFeatureConfiguration};
 use helix_core::Range;
 use serde::de::{self, Deserialize, Deserializer};
 use serde::Serialize;
@@ -999,8 +999,8 @@ impl Document {
             None => return false,
         };
         language_config.language_servers.iter().any(|c| match c {
-            LanguageServerFeatureConfiguation::Simple(name) => name == language_server.name(),
-            LanguageServerFeatureConfiguation::Features {
+            LanguageServerFeatureConfiguration::Simple(name) => name == language_server.name(),
+            LanguageServerFeatureConfiguration::Features {
                 only_features,
                 except_features,
                 name,
@@ -1029,11 +1029,11 @@ impl Document {
             .language_servers
             .iter()
             .filter_map(|c| match c {
-                LanguageServerFeatureConfiguation::Simple(name) => language_servers
+                LanguageServerFeatureConfiguration::Simple(name) => language_servers
                     .iter()
                     .find(|ls| ls.name() == name)
                     .copied(),
-                LanguageServerFeatureConfiguation::Features {
+                LanguageServerFeatureConfiguration::Features {
                     only_features,
                     except_features,
                     name,

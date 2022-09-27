@@ -111,7 +111,7 @@ Language servers are configured separately in the table `language-server` in the
 For example:
 
 ```toml
-[langauge-server.mylang-lsp]
+[language-server.mylang-lsp]
 command = "mylang-lsp"
 args = ["--stdio"]
 config = { provideFormatter = true }
@@ -138,7 +138,7 @@ A `format` sub-table within `config` can be used to pass extra formatting option
 For example with typescript:
 
 ```toml
-[langauge-server.typescript-language-server]
+[language-server.typescript-language-server]
 # pass format options according to https://github.com/typescript-language-server/typescript-language-server#workspacedidchangeconfiguration omitting the "[language].format." prefix.
 config = { format = { "semicolons" = "insert", "insertSpaceBeforeFunctionParenthesis" = true } }
 ```
