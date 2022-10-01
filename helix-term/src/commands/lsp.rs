@@ -530,7 +530,12 @@ pub fn code_action(cx: &mut Context) {
                     None => return,
                 };
 
-                let mut code_actions_menu_open = code_actions_menu_open.lock().unwrap();
+                let mut code_actions_menu_open = if let Ok(lock) = code_actions_menu_open.lock() {
+                    lock
+                } else {
+                    editor.set_status("Mutex is poisoned, something is seriously wrong here");
+                    return;
+                };
 
                 if actions.is_empty() && !*code_actions_menu_open {
                     editor.set_status("No code actions available");
