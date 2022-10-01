@@ -561,7 +561,6 @@ impl Application {
                                     use helix_core::diagnostic::{Diagnostic, Range, Severity::*};
                                     use lsp::DiagnosticSeverity;
 
-                                    // let language_server = get_language_server!();
                                     // TODO: convert inside server
                                     let start = if let Some(start) = lsp_pos_to_pos(
                                         text,

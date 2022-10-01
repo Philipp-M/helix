@@ -222,21 +222,6 @@ fn sym_picker(
     FilePicker::new(
         symbols,
         current_path.clone(),
-        // move |(symbol, _offset_encoding)| {
-        //     if current_path.as_ref() == Some(&symbol.location.uri) {
-        //         symbol.name.as_str().into()
-        //     } else {
-        //         match symbol.location.uri.to_file_path() {
-        //             Ok(path) => {
-        //                 let relative_path = helix_core::path::get_relative_path(path.as_path())
-        //                     .to_string_lossy()
-        //                     .into_owned();
-        //                 format!("{} ({})", &symbol.name, relative_path).into()
-        //             }
-        //             Err(_) => format!("{} ({})", &symbol.name, &symbol.location.uri).into(),
-        //         }
-        //     }
-        // },
         move |cx, (symbol, offset_encoding), action| {
             if current_path.as_ref() == Some(&symbol.location.uri) {
                 let (view, doc) = current!(cx.editor);
