@@ -541,10 +541,8 @@ pub fn code_action(cx: &mut Context) {
                     editor.set_status("No code actions available");
                     return;
                 }
-
-                let code_actions_menu = compositor.find_id::<Popup<
-                    ui::Menu<(lsp::CodeActionOrCommand, OffsetEncoding)>,
-                >>("code-action");
+                type CodeActionsMenu = Popup<ui::Menu<(lsp::CodeActionOrCommand, OffsetEncoding)>>;
+                let code_actions_menu = compositor.find_id::<CodeActionsMenu>("code-action");
 
                 if !*code_actions_menu_open || code_actions_menu.is_none() {
                     let mut picker =
