@@ -3876,6 +3876,10 @@ pub fn completion(cx: &mut Context) {
     };
     cx.jobs.callback(clear_completion);
 
+    if let Err(e) = helix_lsp::block_on(cx.jobs.finish()) {
+        return cx.editor.set_status(format!("{e}"));
+    };
+
     use helix_lsp::{lsp, util::pos_to_lsp_pos};
 
     let (view, doc) = current!(cx.editor);

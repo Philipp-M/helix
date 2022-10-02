@@ -904,7 +904,7 @@ pub fn goto_reference(cx: &mut Context) {
     );
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 pub enum SignatureHelpInvoked {
     Manual,
     Automatic,
@@ -916,7 +916,6 @@ pub fn signature_help(cx: &mut Context) {
 
 pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
     let doc = doc!(cx.editor);
-    let was_manually_invoked = invoked == SignatureHelpInvoked::Manual;
 
     let language_server_id = match doc
         .language_servers_with_feature(LanguageServerFeature::SignatureHelp)
@@ -926,7 +925,7 @@ pub fn signature_help_impl(cx: &mut Context, invoked: SignatureHelpInvoked) {
         None => {
             // Do not show the message if signature help was invoked
             // automatically on backspace, trigger characters, etc.
-            if was_manually_invoked {
+            if invoked == SignatureHelpInvoked::Manual {
                 cx.editor
                     .set_status("Language server not active for current buffer");
             }
@@ -941,7 +940,6 @@ pub fn signature_help_impl_with_language_server_id(
     language_server_id: usize,
     invoked: SignatureHelpInvoked,
 ) {
-    let was_manually_invoked = invoked == SignatureHelpInvoked::Manual;
     let (view, doc) = current!(cx.editor);
     let language_server = language_server_by_id!(cx.editor, language_server_id);
     let offset_encoding = language_server.offset_encoding();
@@ -960,7 +958,7 @@ pub fn signature_help_impl_with_language_server_id(
 
             if !(config.lsp.auto_signature_help
                 || SignatureHelp::visible_popup(compositor).is_some()
-                || was_manually_invoked)
+                || invoked == SignatureHelpInvoked::Manual)
             {
                 return;
             }
