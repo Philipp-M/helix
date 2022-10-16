@@ -212,8 +212,7 @@ where
 {
     let (warnings, errors) = context
         .doc
-        .diagnostics()
-        .iter()
+        .shown_diagnostics()
         .fold((0, 0), |mut counts, diag| {
             use helix_core::diagnostic::Severity;
             match diag.severity {

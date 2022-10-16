@@ -2815,7 +2815,7 @@ fn goto_pos(editor: &mut Editor, pos: usize) {
 
 fn goto_first_diag(cx: &mut Context) {
     let doc = doc!(cx.editor);
-    let pos = match doc.diagnostics().first() {
+    let pos = match doc.shown_diagnostics().next() {
         Some(diag) => diag.range.start,
         None => return,
     };
@@ -2824,7 +2824,7 @@ fn goto_first_diag(cx: &mut Context) {
 
 fn goto_last_diag(cx: &mut Context) {
     let doc = doc!(cx.editor);
-    let pos = match doc.diagnostics().last() {
+    let pos = match doc.shown_diagnostics().last() {
         Some(diag) => diag.range.start,
         None => return,
     };
@@ -2841,10 +2841,9 @@ fn goto_next_diag(cx: &mut Context) {
         .cursor(doc.text().slice(..));
 
     let diag = doc
-        .diagnostics()
-        .iter()
+        .shown_diagnostics()
         .find(|diag| diag.range.start > cursor_pos)
-        .or_else(|| doc.diagnostics().first());
+        .or_else(|| doc.shown_diagnostics().next());
 
     let pos = match diag {
         Some(diag) => diag.range.start,
@@ -2864,11 +2863,12 @@ fn goto_prev_diag(cx: &mut Context) {
         .cursor(doc.text().slice(..));
 
     let diag = doc
-        .diagnostics()
-        .iter()
+        .shown_diagnostics()
+        .collect::<Vec<_>>()
+        .into_iter()
         .rev()
         .find(|diag| diag.range.start < cursor_pos)
-        .or_else(|| doc.diagnostics().last());
+        .or_else(|| doc.shown_diagnostics().last());
 
     let pos = match diag {
         Some(diag) => diag.range.start,

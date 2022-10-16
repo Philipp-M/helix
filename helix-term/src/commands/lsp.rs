@@ -492,6 +492,7 @@ pub fn code_action(cx: &mut Context) {
     for language_server in doc.language_servers_with_feature(LanguageServerFeature::CodeAction) {
         let offset_encoding = language_server.offset_encoding();
         let range = range_to_lsp_range(doc.text(), selection_range, offset_encoding);
+        let ls_id = language_server.id();
 
         requests.push((
             language_server.code_actions(
@@ -505,6 +506,7 @@ pub fn code_action(cx: &mut Context) {
                         .filter(|&diag| {
                             selection_range
                                 .overlaps(&helix_core::Range::new(diag.range.start, diag.range.end))
+                                && diag.language_server_id == ls_id
                         })
                         .map(|diag| diagnostic_to_lsp_diagnostic(doc.text(), diag, offset_encoding))
                         .collect(),
@@ -512,7 +514,7 @@ pub fn code_action(cx: &mut Context) {
                 },
             ),
             offset_encoding,
-            language_server.id(),
+            ls_id,
         ));
     }
 
