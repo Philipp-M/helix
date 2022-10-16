@@ -546,13 +546,7 @@ impl Application {
                                 .find(|l| l.id() == server_id)
                                 .copied()
                                 .unwrap();
-
-                            if !doc.language_server_supports_feature(
-                                language_server,
-                                syntax::LanguageServerFeature::Diagnostics,
-                            ) {
-                                return;
-                            }
+                            let language_server_id = language_server.id();
 
                             let diagnostics = params
                                 .diagnostics
@@ -641,11 +635,13 @@ impl Application {
                                         code,
                                         tags,
                                         source: diagnostic.source.clone(),
+                                        language_server_id,
                                     })
                                 })
                                 .collect();
 
-                            doc.set_diagnostics(diagnostics);
+                            doc.clear_diagnostics(language_server_id);
+                            doc.append_diagnostics(diagnostics);
                         }
 
                         // Sort diagnostics first by severity and then by line numbers.

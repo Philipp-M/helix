@@ -302,11 +302,14 @@ impl EditorView {
         let mut warning_vec = Vec::new();
         let mut error_vec = Vec::new();
 
-        let diagnostics = doc.diagnostics();
+        let diagnostics = doc.shown_diagnostics();
 
         // Diagnostics must be sorted by range. Otherwise, the merge strategy
         // below would not be accurate.
-        debug_assert!(diagnostics
+        debug_assert!(doc
+            .shown_diagnostics()
+            .collect::<Vec<_>>()
+            .as_slice()
             .windows(2)
             .all(|window| window[0].range.start <= window[1].range.start
                 && window[0].range.end <= window[1].range.end));
@@ -789,7 +792,7 @@ impl EditorView {
             .primary()
             .cursor(doc.text().slice(..));
 
-        let diagnostics = doc.diagnostics().iter().filter(|diagnostic| {
+        let diagnostics = doc.shown_diagnostics().filter(|diagnostic| {
             diagnostic.range.start <= cursor && diagnostic.range.end >= cursor
         });
 
