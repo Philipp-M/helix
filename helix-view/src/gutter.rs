@@ -3,7 +3,7 @@ use std::fmt::Write;
 use helix_vcs::LineDiff;
 
 use crate::{
-    graphics::{Color, Modifier, Style},
+    graphics::{Color, Style, UnderlineStyle},
     Document, Editor, Theme, View,
 };
 
@@ -174,7 +174,7 @@ pub fn breakpoints<'doc>(
             .find(|breakpoint| breakpoint.line == line)?;
 
         let mut style = if breakpoint.condition.is_some() && breakpoint.log_message.is_some() {
-            error.add_modifier(Modifier::UNDERLINED)
+            error.underline_style(UnderlineStyle::Line)
         } else if breakpoint.condition.is_some() {
             error
         } else if breakpoint.log_message.is_some() {
