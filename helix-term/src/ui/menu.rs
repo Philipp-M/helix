@@ -79,11 +79,12 @@ impl<T: Item> Menu<T> {
         editor_data: <T as Item>::Data,
         callback_fn: impl Fn(&mut Editor, Option<&T>, MenuEvent) + 'static,
     ) -> Self {
-        let mut menu = Self {
+        let matches = (0..options.len()).map(|i| (i, 0)).collect();
+        Self {
             options,
             editor_data,
             matcher: Box::new(Matcher::default()),
-            matches: Vec::new(),
+            matches,
             previous_pattern: String::new(),
             cursor: None,
             widths: Vec::new(),
@@ -92,10 +93,7 @@ impl<T: Item> Menu<T> {
             size: (0, 0),
             viewport: (0, 0),
             recalculate: true,
-        };
-
-        menu.recalculate_score(true);
-        menu
+        }
     }
 
     pub fn recalculate_score(&mut self, reset_cursor: bool) {
@@ -118,17 +116,14 @@ impl<T: Item> Menu<T> {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, option)| {
-                        let text = option.filter_text(&self.editor_data);
+                        let text: String = option.filter_text(&self.editor_data).into();
                         // TODO: using fuzzy_indices could give us the char idx for match highlighting
                         self.matcher
                             .fuzzy_match(&text, &self.previous_pattern)
                             .map(|score| (index, score))
                     }),
             );
-            // matches.sort_unstable_by_key(|(_, score)| -score);
-            self.matches.sort_unstable_by_key(|(index, _score)| {
-                self.options[*index].sort_text(&self.editor_data)
-            });
+            self.matches.sort_unstable_by_key(|(_, score)| -score);
         }
 
         self.scroll = 0;
