@@ -73,7 +73,7 @@ impl Client {
         let stderr = BufReader::new(process.stderr.take().expect("Failed to open stderr"));
 
         let (server_rx, server_tx, initialize_notify) =
-            Transport::start(reader, writer, stderr, id);
+            Transport::start(reader, writer, stderr, id, name.clone());
 
         let root_path = find_root(
             doc_path.and_then(|x| x.parent().and_then(|x| x.to_str())),
