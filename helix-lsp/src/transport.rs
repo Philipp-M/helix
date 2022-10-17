@@ -38,6 +38,7 @@ enum ServerMessage {
 #[derive(Debug)]
 pub struct Transport {
     id: usize,
+    name: String,
     pending_requests: Mutex<HashMap<jsonrpc::Id, Sender<Result<Value>>>>,
 }
 
@@ -47,6 +48,7 @@ impl Transport {
         server_stdin: BufWriter<ChildStdin>,
         server_stderr: BufReader<ChildStderr>,
         id: usize,
+        name: String,
     ) -> (
         UnboundedReceiver<(usize, jsonrpc::Call)>,
         UnboundedSender<Payload>,
@@ -58,6 +60,7 @@ impl Transport {
 
         let transport = Self {
             id,
+            name,
             pending_requests: Mutex::new(HashMap::default()),
         };
 
@@ -83,6 +86,7 @@ impl Transport {
     async fn recv_server_message(
         reader: &mut (impl AsyncBufRead + Unpin + Send),
         buffer: &mut String,
+        language_server_name: &str,
     ) -> Result<ServerMessage> {
         let mut content_length = None;
         loop {
@@ -124,7 +128,7 @@ impl Transport {
         reader.read_exact(&mut content).await?;
         let msg = std::str::from_utf8(&content).context("invalid utf8 from server")?;
 
-        info!("<- {}", msg);
+        info!("{language_server_name} <- {msg}");
 
         // try parsing as output (server response) or call (server request)
         let output: serde_json::Result<ServerMessage> = serde_json::from_str(msg);
@@ -135,12 +139,13 @@ impl Transport {
     async fn recv_server_error(
         err: &mut (impl AsyncBufRead + Unpin + Send),
         buffer: &mut String,
+        language_server_name: &str,
     ) -> Result<()> {
         buffer.truncate(0);
         if err.read_line(buffer).await? == 0 {
             return Err(Error::StreamClosed);
         };
-        error!("err <- {:?}", buffer);
+        error!("{language_server_name} err <- {buffer:?}");
 
         Ok(())
     }
@@ -162,15 +167,17 @@ impl Transport {
             Payload::Notification(value) => serde_json::to_string(&value)?,
             Payload::Response(error) => serde_json::to_string(&error)?,
         };
-        self.send_string_to_server(server_stdin, json).await
+        self.send_string_to_server(server_stdin, json, &self.name)
+            .await
     }
 
     async fn send_string_to_server(
         &self,
         server_stdin: &mut BufWriter<ChildStdin>,
         request: String,
+        language_server_name: &str,
     ) -> Result<()> {
-        info!("-> {}", request);
+        info!("{language_server_name} -> {request}");
 
         // send the headers
         server_stdin
@@ -240,31 +247,35 @@ impl Transport {
     ) {
         let mut recv_buffer = String::new();
         loop {
-            match Self::recv_server_message(&mut server_stdout, &mut recv_buffer).await {
+            match Self::recv_server_message(&mut server_stdout, &mut recv_buffer, &transport.name)
+                .await
+            {
                 Ok(msg) => {
                     match transport.process_server_message(&client_tx, msg).await {
                         Ok(_) => {}
                         Err(err) => {
-                            error!("err: <- {:?}", err);
+                            error!("{} err: <- {err:?}", transport.name);
                             break;
                         }
                     };
                 }
                 Err(err) => {
-                    error!("err: <- {:?}", err);
+                    error!("{} err: <- {err:?}", transport.name);
                     break;
                 }
             }
         }
     }
 
-    async fn err(_transport: Arc<Self>, mut server_stderr: BufReader<ChildStderr>) {
+    async fn err(transport: Arc<Self>, mut server_stderr: BufReader<ChildStderr>) {
         let mut recv_buffer = String::new();
         loop {
-            match Self::recv_server_error(&mut server_stderr, &mut recv_buffer).await {
+            match Self::recv_server_error(&mut server_stderr, &mut recv_buffer, &transport.name)
+                .await
+            {
                 Ok(_) => {}
                 Err(err) => {
-                    error!("err: <- {:?}", err);
+                    error!("{} err: <- {err:?}", transport.name);
                     break;
                 }
             }
