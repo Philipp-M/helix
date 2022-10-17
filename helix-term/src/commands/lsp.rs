@@ -469,10 +469,16 @@ pub fn workspace_diagnostics_picker(cx: &mut Context) {
     cx.push_layer(Box::new(overlayed(picker)));
 }
 
-impl ui::menu::Item for (lsp::CodeActionOrCommand, OffsetEncoding) {
+struct CodeActionOrCommandMenuItem {
+    action_or_command: lsp::CodeActionOrCommand,
+    offset_encoding: OffsetEncoding,
+    language_server_id: usize,
+}
+
+impl ui::menu::Item for CodeActionOrCommandMenuItem {
     type Data = ();
     fn label(&self, _data: &Self::Data) -> Spans {
-        match &self.0 {
+        match &self.action_or_command {
             lsp::CodeActionOrCommand::CodeAction(action) => action.title.as_str().into(),
             lsp::CodeActionOrCommand::Command(command) => command.title.as_str().into(),
         }
@@ -549,7 +555,7 @@ pub fn code_action(cx: &mut Context) {
     for language_server in doc.language_servers_with_feature(LanguageServerFeature::CodeAction) {
         let offset_encoding = language_server.offset_encoding();
         let range = range_to_lsp_range(doc.text(), selection_range, offset_encoding);
-        let ls_id = language_server.id();
+        let language_server_id = language_server.id();
 
         requests.push((
             language_server.code_actions(
@@ -563,7 +569,7 @@ pub fn code_action(cx: &mut Context) {
                         .filter(|&diag| {
                             selection_range
                                 .overlaps(&helix_core::Range::new(diag.range.start, diag.range.end))
-                                && diag.language_server_id == ls_id
+                                && diag.language_server_id == language_server_id
                         })
                         .map(|diag| diagnostic_to_lsp_diagnostic(doc.text(), diag, offset_encoding))
                         .collect(),
@@ -571,11 +577,11 @@ pub fn code_action(cx: &mut Context) {
                 },
             ),
             offset_encoding,
-            ls_id,
+            language_server_id,
         ));
     }
 
-    for (future, offset_encoding, lsp_id) in requests {
+    for (future, offset_encoding, language_server_id) in requests {
         let code_actions_menu_open = code_actions_menu_open.clone();
 
         cx.callback(
@@ -584,7 +590,11 @@ pub fn code_action(cx: &mut Context) {
                 let mut actions = match response {
                     Some(a) => a
                         .into_iter()
-                        .map(|a| (a, offset_encoding))
+                        .map(|a| CodeActionOrCommandMenuItem {
+                            action_or_command: a,
+                            offset_encoding,
+                            language_server_id,
+                        })
                         .collect::<Vec<_>>(),
                     None => return,
                 };
@@ -610,31 +620,40 @@ pub fn code_action(cx: &mut Context) {
                 // submenus that only contain a certain category (see `action_category`) of actions.
                 //
                 // Below this done in in a single sorting step
-                actions.sort_by(|(action1, _), (action2, _)| {
-                    // sort actions by category
-                    let order = action_category(action1).cmp(&action_category(action2));
-                    if order != Ordering::Equal {
-                        return order;
-                    }
-                    // within the categories sort by relevancy.
-                    // Modeled after the `codeActionsComparator` function in vscode:
-                    // https://github.com/microsoft/vscode/blob/eaec601dd69aeb4abb63b9601a6f44308c8d8c6e/src/vs/editor/contrib/codeAction/browser/codeAction.ts
+                actions.sort_by(
+                    |CodeActionOrCommandMenuItem {
+                         action_or_command: action1,
+                         ..
+                     },
+                     CodeActionOrCommandMenuItem {
+                         action_or_command: action2,
+                         ..
+                     }| {
+                        // sort actions by category
+                        let order = action_category(action1).cmp(&action_category(action2));
+                        if order != Ordering::Equal {
+                            return order;
+                        }
+                        // within the categories sort by relevancy.
+                        // Modeled after the `codeActionsComparator` function in vscode:
+                        // https://github.com/microsoft/vscode/blob/eaec601dd69aeb4abb63b9601a6f44308c8d8c6e/src/vs/editor/contrib/codeAction/browser/codeAction.ts
 
-                    // if one code action fixes a diagnostic but the other one doesn't show it first
-                    let order = action_fixes_diagnostics(action1)
-                        .cmp(&action_fixes_diagnostics(action2))
-                        .reverse();
-                    if order != Ordering::Equal {
-                        return order;
-                    }
+                        // if one code action fixes a diagnostic but the other one doesn't show it first
+                        let order = action_fixes_diagnostics(action1)
+                            .cmp(&action_fixes_diagnostics(action2))
+                            .reverse();
+                        if order != Ordering::Equal {
+                            return order;
+                        }
 
-                    // if one of the codeactions is marked as prefered show it first
-                    // otherwise keep the original LSP sorting
-                    action_prefered(action1)
-                        .cmp(&action_prefered(action2))
-                        .reverse()
-                });
-                type CodeActionsMenu = Popup<ui::Menu<(lsp::CodeActionOrCommand, OffsetEncoding)>>;
+                        // if one of the codeactions is marked as prefered show it first
+                        // otherwise keep the original LSP sorting
+                        action_prefered(action1)
+                            .cmp(&action_prefered(action2))
+                            .reverse()
+                    },
+                );
+                type CodeActionsMenu = Popup<ui::Menu<CodeActionOrCommandMenuItem>>;
                 let code_actions_menu = compositor.find_id::<CodeActionsMenu>("code-action");
 
                 if !*code_actions_menu_open || code_actions_menu.is_none() {
@@ -645,18 +664,17 @@ pub fn code_action(cx: &mut Context) {
                             }
 
                             // always present here
-                            let code_action = code_action.unwrap();
+                            let CodeActionOrCommandMenuItem {
+                                action_or_command,
+                                offset_encoding,
+                                language_server_id: lsp_id,
+                            } = code_action.unwrap();
 
-                            match code_action {
-                                (lsp::CodeActionOrCommand::Command(command), _encoding) => {
-                                    log::debug!("code action command: {:?}", command);
-                                    execute_lsp_command(editor, lsp_id, command.clone());
+                            match action_or_command {
+                                lsp::CodeActionOrCommand::Command(command) => {
+                                    execute_lsp_command(editor, *lsp_id, command.clone());
                                 }
-                                (
-                                    lsp::CodeActionOrCommand::CodeAction(code_action),
-                                    offset_encoding,
-                                ) => {
-                                    log::debug!("code action: {:?}", code_action);
+                                lsp::CodeActionOrCommand::CodeAction(code_action) => {
                                     if let Some(ref workspace_edit) = code_action.edit {
                                         log::debug!("edit: {:?}", workspace_edit);
                                         apply_workspace_edit(
@@ -669,7 +687,7 @@ pub fn code_action(cx: &mut Context) {
                                     // if code action provides both edit and command first the edit
                                     // should be applied and then the command
                                     if let Some(command) = &code_action.command {
-                                        execute_lsp_command(editor, lsp_id, command.clone());
+                                        execute_lsp_command(editor, *lsp_id, command.clone());
                                     }
                                 }
                             }

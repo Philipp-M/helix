@@ -3941,10 +3941,7 @@ pub fn completion_lsp(cx: &mut Context, language_server_id: usize) {
             .collect::<Vec<_>>();
 
             if !prefix.is_empty() {
-                items = items
-                    .into_iter()
-                    .filter(|item| item.filter_text(&()).starts_with(&prefix))
-                    .collect();
+                items.retain(|item| item.filter_text(&()).starts_with(&prefix));
             }
 
             if items.is_empty() {

@@ -196,9 +196,13 @@ impl Transport {
         &self,
         client_tx: &UnboundedSender<(usize, jsonrpc::Call)>,
         msg: ServerMessage,
+        language_server_name: &str,
     ) -> Result<()> {
         match msg {
-            ServerMessage::Output(output) => self.process_request_response(output).await?,
+            ServerMessage::Output(output) => {
+                self.process_request_response(output, language_server_name)
+                    .await?
+            }
             ServerMessage::Call(call) => {
                 client_tx
                     .send((self.id, call))
@@ -209,14 +213,18 @@ impl Transport {
         Ok(())
     }
 
-    async fn process_request_response(&self, output: jsonrpc::Output) -> Result<()> {
+    async fn process_request_response(
+        &self,
+        output: jsonrpc::Output,
+        language_server_name: &str,
+    ) -> Result<()> {
         let (id, result) = match output {
             jsonrpc::Output::Success(jsonrpc::Success { id, result, .. }) => {
-                info!("<- {}", result);
+                info!("{language_server_name} <- {}", result);
                 (id, Ok(result))
             }
             jsonrpc::Output::Failure(jsonrpc::Failure { id, error, .. }) => {
-                error!("<- {}", error);
+                error!("{language_server_name} <- {error}");
                 (id, Err(error.into()))
             }
         };
@@ -251,7 +259,10 @@ impl Transport {
                 .await
             {
                 Ok(msg) => {
-                    match transport.process_server_message(&client_tx, msg).await {
+                    match transport
+                        .process_server_message(&client_tx, msg, &transport.name)
+                        .await
+                    {
                         Ok(_) => {}
                         Err(err) => {
                             error!("{} err: <- {err:?}", transport.name);
@@ -329,10 +340,11 @@ impl Transport {
                         method: lsp_types::notification::Initialized::METHOD.to_string(),
                         params: jsonrpc::Params::None,
                     }));
-                    match transport.process_server_message(&client_tx, notification).await {
+                    let language_server_name = &transport.name;
+                    match transport.process_server_message(&client_tx, notification, language_server_name).await {
                         Ok(_) => {}
                         Err(err) => {
-                            error!("err: <- {:?}", err);
+                            error!("{language_server_name} err: <- {err:?}");
                         }
                     }
 
@@ -342,7 +354,7 @@ impl Transport {
                         match transport.send_payload_to_server(&mut server_stdin, msg).await {
                             Ok(_) => {}
                             Err(err) => {
-                                error!("err: <- {:?}", err);
+                                error!("{language_server_name} err: <- {err:?}");
                             }
                         }
                     }
@@ -361,7 +373,7 @@ impl Transport {
                             match transport.send_payload_to_server(&mut server_stdin, msg).await {
                                 Ok(_) => {}
                                 Err(err) => {
-                                    error!("err: <- {:?}", err);
+                                    error!("{} err: <- {err:?}", transport.name);
                                 }
                             }
                         }
