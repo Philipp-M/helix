@@ -638,7 +638,33 @@ impl Application {
                                         language_server_id,
                                     })
                                 })
-                                .collect();
+                                .collect::<Vec<_>>();
+
+                            doc.clear_text_annotations("diagnostics");
+
+                            use helix_core::diagnostic::Severity;
+                            use helix_view::decorations::{TextAnnotation, TextAnnotationKind};
+                            use helix_view::graphics::{Color, Style};
+                            let style = Style::default().bg(Color::Indexed(10));
+                            doc.push_text_annotations(
+                                "diagnostics",
+                                diagnostics.iter().map(|d| TextAnnotation {
+                                    // scope: "diagnostics".into(),
+                                    text: d.message.clone().into(),
+                                    style: d
+                                        .severity
+                                        .as_ref()
+                                        .map(|s| match s {
+                                            Severity::Error => style.fg(Color::Red),
+                                            Severity::Warning => style.fg(Color::Yellow),
+                                            Severity::Info => style.fg(Color::Blue),
+                                            Severity::Hint => style.fg(Color::Green),
+                                        })
+                                        .unwrap_or_else(|| style.fg(Color::Yellow)),
+                                    line: d.line,
+                                    kind: TextAnnotationKind::Eol,
+                                }), // .collect::<Vec<_>>(),
+                            );
 
                             doc.clear_diagnostics(language_server_id);
                             doc.append_diagnostics(diagnostics);
