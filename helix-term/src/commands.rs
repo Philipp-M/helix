@@ -49,6 +49,7 @@ use movement::Movement;
 use crate::{
     args,
     compositor::{self, Component, Compositor},
+    job::Callback,
     keymap::ReverseKeymap,
     ui::{
         self, menu::Item, overlay::overlayed, CompletionItem, FilePicker, PathType, Picker, Popup,
@@ -56,8 +57,8 @@ use crate::{
     },
 };
 
-use crate::job::{self, Job, Jobs};
-use futures_util::{FutureExt, StreamExt};
+use crate::job::{self, Jobs};
+use futures_util::StreamExt;
 use std::{collections::HashMap, fmt, future::Future};
 use std::{collections::HashSet, num::NonZeroUsize};
 
@@ -112,10 +113,11 @@ impl<'a> Context<'a> {
         let callback = Box::pin(async move {
             let json = call.await?;
             let response = serde_json::from_value(json)?;
-            let call: job::Callback =
-                Box::new(move |editor: &mut Editor, compositor: &mut Compositor| {
+            let call: job::Callback = Callback::EditorCompositor(Box::new(
+                move |editor: &mut Editor, compositor: &mut Compositor| {
                     callback(editor, compositor, response)
-                });
+                },
+            ));
             Ok(call)
         });
         self.jobs.callback(callback);
@@ -1930,8 +1932,8 @@ fn global_search(cx: &mut Context) {
     let show_picker = async move {
         let all_matches: Vec<FileResult> =
             UnboundedReceiverStream::new(all_matches_rx).collect().await;
-        let call: job::Callback =
-            Box::new(move |editor: &mut Editor, compositor: &mut Compositor| {
+        let call: job::Callback = Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
                 if all_matches.is_empty() {
                     editor.set_status("No matches found");
                     return;
@@ -1967,7 +1969,8 @@ fn global_search(cx: &mut Context) {
                     },
                 );
                 compositor.push(Box::new(overlayed(picker)));
-            });
+            },
+        ));
         Ok(call)
     };
     cx.jobs.callback(show_picker);
@@ -2509,13 +2512,6 @@ fn insert_at_line_end(cx: &mut Context) {
     doc.set_selection(view.id, selection);
 }
 
-/// Sometimes when applying formatting changes we want to mark the buffer as unmodified, for
-/// example because we just applied the same changes while saving.
-enum Modified {
-    SetUnmodified,
-    LeaveModified,
-}
-
 // Creates an LspCallback that waits for formatting changes to be computed. When they're done,
 // it applies them, but only if the doc hasn't changed.
 //
@@ -2524,11 +2520,12 @@ enum Modified {
 async fn make_format_callback(
     doc_id: DocumentId,
     doc_version: i32,
-    modified: Modified,
     format: impl Future<Output = Result<Transaction, FormatterError>> + Send + 'static,
+    write: Option<(Option<PathBuf>, bool)>,
 ) -> anyhow::Result<job::Callback> {
-    let format = format.await?;
-    let call: job::Callback = Box::new(move |editor, _compositor| {
+    let format = format.await;
+
+    let call: job::Callback = Callback::Editor(Box::new(move |editor| {
         if !editor.documents.contains_key(&doc_id) {
             return;
         }
@@ -2536,22 +2533,30 @@ async fn make_format_callback(
         let scrolloff = editor.config().scrolloff;
         let doc = doc_mut!(editor, &doc_id);
         let view = view_mut!(editor);
-        if doc.version() == doc_version {
-            apply_transaction(&format, doc, view);
-            doc.append_changes_to_history(view.id);
-            doc.detect_indent_and_line_ending();
-            view.ensure_cursor_in_view(doc, scrolloff);
-            if let Modified::SetUnmodified = modified {
-                doc.reset_modified();
+
+        if let Ok(format) = format {
+            if doc.version() == doc_version {
+                apply_transaction(&format, doc, view);
+                doc.append_changes_to_history(view.id);
+                doc.detect_indent_and_line_ending();
+                view.ensure_cursor_in_view(doc, scrolloff);
+            } else {
+                log::info!("discarded formatting changes because the document changed");
             }
-        } else {
-            log::info!("discarded formatting changes because the document changed");
         }
-    });
+
+        if let Some((path, force)) = write {
+            let id = doc.id();
+            if let Err(err) = editor.save(id, path, force) {
+                editor.set_error(format!("Error saving: {}", err));
+            }
+        }
+    }));
+
     Ok(call)
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq)]
 pub enum Open {
     Below,
     Above,
@@ -2890,7 +2895,7 @@ pub mod insert {
 
     /// Exclude the cursor in range.
     fn exclude_cursor(text: RopeSlice, range: Range, cursor: Range) -> Range {
-        if range.to() == cursor.to() {
+        if range.to() == cursor.to() && text.len_chars() != cursor.to() {
             Range::new(
                 range.from(),
                 graphemes::prev_grapheme_boundary(text, cursor.to()),
@@ -3882,15 +3887,15 @@ fn remove_primary_selection(cx: &mut Context) {
 }
 
 pub fn completion_lsp(cx: &mut Context, language_server_id: usize) {
+    if let Err(e) = helix_lsp::block_on(cx.jobs.finish(cx.editor, None)) {
+        return cx.editor.set_status(format!("{e}"));
+    };
+
     let language_server = cx
         .editor
         .language_servers
         .get_by_id(language_server_id)
         .unwrap();
-
-    if let Err(e) = helix_lsp::block_on(cx.jobs.finish()) {
-        return cx.editor.set_status(format!("{e}"));
-    };
 
     use helix_lsp::{lsp, util::pos_to_lsp_pos};
 
@@ -3976,8 +3981,8 @@ pub fn completion_path(cx: &mut Context) {
     let start_offset = cursor.saturating_sub(offset);
 
     let callback = async move {
-        let call: job::Callback =
-            Box::new(move |editor: &mut Editor, compositor: &mut Compositor| {
+        let call = job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
                 if editor.mode != Mode::Insert {
                     // we're not in insert mode anymore
                     return;
@@ -4057,7 +4062,8 @@ pub fn completion_path(cx: &mut Context) {
                 let size = compositor.size();
                 let ui = compositor.find::<ui::EditorView>().unwrap();
                 ui.set_or_extend_completion(editor, items, start_offset, trigger_offset, size);
-            });
+            },
+        ));
         Ok(call)
     };
     cx.jobs.callback(callback);
@@ -4067,11 +4073,12 @@ pub fn completion(cx: &mut Context) {
     // TODO completion starts to get ugly...
     // maybe think about something like completion provider and separate completion-state into helix-view?
     let clear_completion = async move {
-        let call: job::Callback =
-            Box::new(move |editor: &mut Editor, compositor: &mut Compositor| {
+        let call = job::Callback::EditorCompositor(Box::new(
+            move |editor: &mut Editor, compositor: &mut Compositor| {
                 let ui = compositor.find::<ui::EditorView>().unwrap();
                 ui.clear_completion(editor);
-            });
+            },
+        ));
         Ok(call)
     };
     cx.jobs.callback(clear_completion);

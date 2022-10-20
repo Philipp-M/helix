@@ -667,7 +667,7 @@ name = "julia"
 scope = "source.julia"
 injection-regex = "julia"
 file-types = ["jl"]
-roots = []
+roots = ["Manifest.toml", "Project.toml"]
 comment-token = "#"
 language-servers = [ "julia" ]
 indent = { tab-width = 4, unit = "    " }
@@ -1121,7 +1121,7 @@ name = "git-config"
 scope = "source.gitconfig"
 roots = []
 # TODO: allow specifying file-types as a regex so we can read directory names (e.g. `.git/config`)
-file-types = [".gitmodules", ".gitconfig"]
+file-types = [".gitmodules", ".gitconfig", ".git/config", ".config/git/config"]
 injection-regex = "git-config"
 comment-token = "#"
 indent = { tab-width = 4, unit = "\t" }
