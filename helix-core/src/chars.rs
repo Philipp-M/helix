@@ -91,12 +91,14 @@ mod test {
 
     #[test]
     fn test_categorize() {
-        const EOL_TEST_CASE: &'static str = "\n\r\u{000B}\u{000C}\u{0085}\u{2028}\u{2029}";
-        const WORD_TEST_CASE: &'static str =
-            "_hello_world_あいうえおー1234567890１２３４５６７８９０";
-        const PUNCTUATION_TEST_CASE: &'static str =
+        #[cfg(not(feature = "unicode-lines"))]
+        const EOL_TEST_CASE: &str = "\n";
+        #[cfg(feature = "unicode-lines")]
+        const EOL_TEST_CASE: &str = "\n\u{000B}\u{000C}\u{0085}\u{2028}\u{2029}";
+        const WORD_TEST_CASE: &str = "_hello_world_あいうえおー1234567890１２３４５６７８９０";
+        const PUNCTUATION_TEST_CASE: &str =
             "!\"#$%&\'()*+,-./:;<=>?@[\\]^`{|}~！”＃＄％＆’（）＊＋、。：；＜＝＞？＠「」＾｀｛｜｝～";
-        const WHITESPACE_TEST_CASE: &'static str = "  　   ";
+        const WHITESPACE_TEST_CASE: &str = "  　   ";
 
         for ch in EOL_TEST_CASE.chars() {
             assert_eq!(CharCategory::Eol, categorize_char(ch));

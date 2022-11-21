@@ -8,7 +8,7 @@ use crate::{
         prev_grapheme_boundary,
     },
     movement::Direction,
-    Assoc, ChangeSet, RopeSlice,
+    Assoc, ChangeSet, RopeGraphemes, RopeSlice,
 };
 use smallvec::{smallvec, SmallVec};
 use std::borrow::Cow;
@@ -122,12 +122,22 @@ impl Range {
         }
     }
 
-    // flips the direction of the selection
+    /// Flips the direction of the selection
     pub fn flip(&self) -> Self {
         Self {
             anchor: self.head,
             head: self.anchor,
             horiz: self.horiz,
+        }
+    }
+
+    /// Returns the selection if it goes in the direction of `direction`,
+    /// flipping the selection otherwise.
+    pub fn with_direction(self, direction: Direction) -> Self {
+        if self.direction() == direction {
+            self
+        } else {
+            self.flip()
         }
     }
 
@@ -138,6 +148,11 @@ impl Range {
         // at it after transforming the slower version that explicitly
         // enumerated more cases.  The unit tests are thorough.
         self.from() == other.from() || (self.to() > other.from() && other.to() > self.from())
+    }
+
+    #[inline]
+    pub fn contains_range(&self, other: &Self) -> bool {
+        self.from() <= other.from() && self.to() >= other.to()
     }
 
     pub fn contains(&self, pos: usize) -> bool {
@@ -217,9 +232,23 @@ impl Range {
 
     // groupAt
 
+    /// Returns the text inside this range given the text of the whole buffer.
+    ///
+    /// The returned `Cow` is a reference if the range of text is inside a single
+    /// chunk of the rope. Otherwise a copy of the text is returned. Consider
+    /// using `slice` instead if you do not need a `Cow` or `String` to avoid copying.
     #[inline]
     pub fn fragment<'a, 'b: 'a>(&'a self, text: RopeSlice<'b>) -> Cow<'b, str> {
-        text.slice(self.from()..self.to()).into()
+        self.slice(text).into()
+    }
+
+    /// Returns the text inside this range given the text of the whole buffer.
+    ///
+    /// The returned value is a reference to the passed slice. This method never
+    /// copies any contents.
+    #[inline]
+    pub fn slice<'a, 'b: 'a>(&'a self, text: RopeSlice<'b>) -> RopeSlice<'b> {
+        text.slice(self.from()..self.to())
     }
 
     //--------------------------------
@@ -333,6 +362,14 @@ impl Range {
     #[must_use]
     pub fn cursor_line(&self, text: RopeSlice) -> usize {
         text.char_to_line(self.cursor(text))
+    }
+
+    /// Returns true if this Range covers a single grapheme in the given text
+    pub fn is_single_grapheme(&self, doc: RopeSlice) -> bool {
+        let mut graphemes = RopeGraphemes::new(doc.slice(self.from()..self.to()));
+        let first = graphemes.next();
+        let second = graphemes.next();
+        first.is_some() && second.is_none()
     }
 }
 
@@ -535,6 +572,10 @@ impl Selection {
         self.ranges.iter().map(move |range| range.fragment(text))
     }
 
+    pub fn slices<'a>(&'a self, text: RopeSlice<'a>) -> impl Iterator<Item = RopeSlice> + 'a {
+        self.ranges.iter().map(move |range| range.slice(text))
+    }
+
     #[inline(always)]
     pub fn iter(&self) -> std::slice::Iter<'_, Range> {
         self.ranges.iter()
@@ -543,6 +584,39 @@ impl Selection {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.ranges.len()
+    }
+
+    // returns true if self ⊇ other
+    pub fn contains(&self, other: &Selection) -> bool {
+        // can't contain other if it is larger
+        if other.len() > self.len() {
+            return false;
+        }
+
+        let (mut iter_self, mut iter_other) = (self.iter(), other.iter());
+        let (mut ele_self, mut ele_other) = (iter_self.next(), iter_other.next());
+
+        loop {
+            match (ele_self, ele_other) {
+                (Some(ra), Some(rb)) => {
+                    if !ra.contains_range(rb) {
+                        // `self` doesn't contain next element from `other`, advance `self`, we need to match all from `other`
+                        ele_self = iter_self.next();
+                    } else {
+                        // matched element from `other`, advance `other`
+                        ele_other = iter_other.next();
+                    };
+                }
+                (None, Some(_)) => {
+                    // exhausted `self`, we can't match the reminder of `other`
+                    return false;
+                }
+                (_, None) => {
+                    // no elements from `other` left to match, `self` contains `other`
+                    return true;
+                }
+            }
+        }
     }
 }
 
@@ -595,7 +669,13 @@ pub fn select_on_matches(
 
             let start = text.byte_to_char(start_byte + mat.start());
             let end = text.byte_to_char(start_byte + mat.end());
-            result.push(Range::new(start, end));
+
+            let range = Range::new(start, end);
+            // Make sure the match is not right outside of the selection.
+            // These invalid matches can come from using RegEx anchors like `^`, `$`
+            if range != Range::point(sel.to()) {
+                result.push(range);
+            }
         }
     }
 
@@ -728,16 +808,16 @@ mod test {
     fn test_contains() {
         let range = Range::new(10, 12);
 
-        assert_eq!(range.contains(9), false);
-        assert_eq!(range.contains(10), true);
-        assert_eq!(range.contains(11), true);
-        assert_eq!(range.contains(12), false);
-        assert_eq!(range.contains(13), false);
+        assert!(!range.contains(9));
+        assert!(range.contains(10));
+        assert!(range.contains(11));
+        assert!(!range.contains(12));
+        assert!(!range.contains(13));
 
         let range = Range::new(9, 6);
-        assert_eq!(range.contains(9), false);
-        assert_eq!(range.contains(7), true);
-        assert_eq!(range.contains(6), true);
+        assert!(!range.contains(9));
+        assert!(range.contains(7));
+        assert!(range.contains(6));
     }
 
     #[test]
@@ -792,7 +872,7 @@ mod test {
     }
 
     #[test]
-    fn test_graphem_aligned() {
+    fn test_grapheme_aligned() {
         let r = Rope::from_str("\r\nHi\r\n");
         let s = r.slice(..);
 
@@ -863,6 +943,76 @@ mod test {
         assert_eq!(Range::new(4, 3).min_width_1(s), Range::new(4, 3));
         assert_eq!(Range::new(5, 4).min_width_1(s), Range::new(5, 4));
         assert_eq!(Range::new(6, 5).min_width_1(s), Range::new(6, 5));
+    }
+
+    #[test]
+    fn test_select_on_matches() {
+        use crate::regex::{Regex, RegexBuilder};
+
+        let r = Rope::from_str("Nobody expects the Spanish inquisition");
+        let s = r.slice(..);
+
+        let selection = Selection::single(0, r.len_chars());
+        assert_eq!(
+            select_on_matches(s, &selection, &Regex::new(r"[A-Z][a-z]*").unwrap()),
+            Some(Selection::new(
+                smallvec![Range::new(0, 6), Range::new(19, 26)],
+                0
+            ))
+        );
+
+        let r = Rope::from_str("This\nString\n\ncontains multiple\nlines");
+        let s = r.slice(..);
+
+        let start_of_line = RegexBuilder::new(r"^").multi_line(true).build().unwrap();
+        let end_of_line = RegexBuilder::new(r"$").multi_line(true).build().unwrap();
+
+        // line without ending
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 4), &start_of_line),
+            Some(Selection::single(0, 0))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 4), &end_of_line),
+            None
+        );
+        // line with ending
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 5), &start_of_line),
+            Some(Selection::single(0, 0))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 5), &end_of_line),
+            Some(Selection::single(4, 4))
+        );
+        // line with start of next line
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 6), &start_of_line),
+            Some(Selection::new(
+                smallvec![Range::point(0), Range::point(5)],
+                0
+            ))
+        );
+        assert_eq!(
+            select_on_matches(s, &Selection::single(0, 6), &end_of_line),
+            Some(Selection::single(4, 4))
+        );
+
+        // multiple lines
+        assert_eq!(
+            select_on_matches(
+                s,
+                &Selection::single(0, s.len_chars()),
+                &RegexBuilder::new(r"^[a-z ]*$")
+                    .multi_line(true)
+                    .build()
+                    .unwrap()
+            ),
+            Some(Selection::new(
+                smallvec![Range::point(12), Range::new(13, 30), Range::new(31, 36)],
+                0
+            ))
+        );
     }
 
     #[test]
@@ -981,5 +1131,31 @@ mod test {
             result.fragments(text.slice(..)).collect::<Vec<_>>(),
             &["", "abcd", "efg", "rs", "xyz"]
         );
+    }
+    #[test]
+    fn test_selection_contains() {
+        fn contains(a: Vec<(usize, usize)>, b: Vec<(usize, usize)>) -> bool {
+            let sela = Selection::new(a.iter().map(|a| Range::new(a.0, a.1)).collect(), 0);
+            let selb = Selection::new(b.iter().map(|b| Range::new(b.0, b.1)).collect(), 0);
+            sela.contains(&selb)
+        }
+
+        // exact match
+        assert!(contains(vec!((1, 1)), vec!((1, 1))));
+
+        // larger set contains smaller
+        assert!(contains(vec!((1, 1), (2, 2), (3, 3)), vec!((2, 2))));
+
+        // multiple matches
+        assert!(contains(vec!((1, 1), (2, 2)), vec!((1, 1), (2, 2))));
+
+        // smaller set can't contain bigger
+        assert!(!contains(vec!((1, 1)), vec!((1, 1), (2, 2))));
+
+        assert!(contains(
+            vec!((1, 1), (2, 4), (5, 6), (7, 9), (10, 13)),
+            vec!((3, 4), (7, 9))
+        ));
+        assert!(!contains(vec!((1, 1), (5, 6)), vec!((1, 6))));
     }
 }

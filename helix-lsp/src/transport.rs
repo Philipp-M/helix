@@ -1,6 +1,5 @@
-use crate::{Error, Result};
+use crate::{jsonrpc, Error, Result};
 use anyhow::Context;
-use jsonrpc_core as jsonrpc;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -215,20 +214,21 @@ impl Transport {
             }
         };
 
-        let tx = self
-            .pending_requests
-            .lock()
-            .await
-            .remove(&id)
-            .expect("pending_request with id not found!");
-
-        match tx.send(result).await {
-            Ok(_) => (),
-            Err(_) => error!(
-                "Tried sending response into a closed channel (id={:?}), original request likely timed out",
-                id
-            ),
-        };
+        if let Some(tx) = self.pending_requests.lock().await.remove(&id) {
+            match tx.send(result).await {
+                Ok(_) => (),
+                Err(_) => error!(
+                    "Tried sending response into a closed channel (id={:?}), original request likely timed out",
+                    id
+                ),
+            };
+        } else {
+            log::error!(
+                "Discarding Language Server response without a request (id={:?}) {:?}",
+                id,
+                result
+            );
+        }
 
         Ok(())
     }
@@ -249,6 +249,26 @@ impl Transport {
                             break;
                         }
                     };
+                }
+                Err(Error::StreamClosed) => {
+                    // Hack: inject a terminated notification so we trigger code that needs to happen after exit
+                    use lsp_types::notification::Notification as _;
+                    let notification =
+                        ServerMessage::Call(jsonrpc::Call::Notification(jsonrpc::Notification {
+                            jsonrpc: None,
+                            method: lsp_types::notification::Exit::METHOD.to_string(),
+                            params: jsonrpc::Params::None,
+                        }));
+                    match transport
+                        .process_server_message(&client_tx, notification)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(err) => {
+                            error!("err: <- {:?}", err);
+                        }
+                    }
+                    break;
                 }
                 Err(err) => {
                     error!("err: <- {:?}", err);

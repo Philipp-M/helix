@@ -1,10 +1,10 @@
-use crate::compositor::{Component, Compositor, Context, EventResult};
+use crate::compositor::{Component, Compositor, Context, Event, EventResult};
 use crate::{alt, ctrl, key, shift, ui};
-use crossterm::event::Event;
 use helix_view::input::KeyEvent;
-use helix_view::keyboard::{KeyCode, KeyModifiers};
+use helix_view::keyboard::KeyCode;
 use std::{borrow::Cow, ops::RangeFrom};
 use tui::buffer::Buffer as Surface;
+use tui::widgets::{Block, Borders, Widget};
 
 use helix_core::{
     unicode::segmentation::GraphemeCursor, unicode::width::UnicodeWidthStr, Position,
@@ -15,21 +15,23 @@ use helix_view::{
 };
 
 pub type Completion = (RangeFrom<usize>, Cow<'static, str>);
+type PromptCharHandler = Box<dyn Fn(&mut Prompt, char, &Context)>;
 
 pub struct Prompt {
     prompt: Cow<'static, str>,
-    pub line: String,
+    line: String,
     cursor: usize,
     completion: Vec<Completion>,
     selection: Option<usize>,
     history_register: Option<char>,
     history_pos: Option<usize>,
-    completion_fn: Box<dyn FnMut(&str) -> Vec<Completion>>,
+    completion_fn: Box<dyn FnMut(&Editor, &str) -> Vec<Completion>>,
     callback_fn: Box<dyn FnMut(&mut Context, &str, PromptEvent)>,
-    pub doc_fn: Box<dyn Fn(&str) -> Option<&'static str>>,
+    pub doc_fn: Box<dyn Fn(&str) -> Option<Cow<str>>>,
+    next_char_handler: Option<PromptCharHandler>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PromptEvent {
     /// The prompt input has been updated.
     Update,
@@ -55,29 +57,51 @@ pub enum Movement {
     None,
 }
 
+fn is_word_sep(c: char) -> bool {
+    c == std::path::MAIN_SEPARATOR || c.is_whitespace()
+}
+
 impl Prompt {
     pub fn new(
         prompt: Cow<'static, str>,
         history_register: Option<char>,
-        mut completion_fn: impl FnMut(&str) -> Vec<Completion> + 'static,
+        completion_fn: impl FnMut(&Editor, &str) -> Vec<Completion> + 'static,
         callback_fn: impl FnMut(&mut Context, &str, PromptEvent) + 'static,
     ) -> Self {
         Self {
             prompt,
             line: String::new(),
             cursor: 0,
-            completion: completion_fn(""),
+            completion: Vec::new(),
             selection: None,
             history_register,
             history_pos: None,
             completion_fn: Box::new(completion_fn),
             callback_fn: Box::new(callback_fn),
             doc_fn: Box::new(|_| None),
+            next_char_handler: None,
         }
     }
 
+    pub fn with_line(mut self, line: String, editor: &Editor) -> Self {
+        let cursor = line.len();
+        self.line = line;
+        self.cursor = cursor;
+        self.recalculate_completion(editor);
+        self
+    }
+
+    pub fn line(&self) -> &String {
+        &self.line
+    }
+
+    pub fn recalculate_completion(&mut self, editor: &Editor) {
+        self.exit_selection();
+        self.completion = (self.completion_fn)(editor, &self.line);
+    }
+
     /// Compute the cursor position after applying movement
-    /// Taken from: https://github.com/wez/wezterm/blob/e0b62d07ca9bf8ce69a61e30a3c20e7abc48ce7e/termwiz/src/lineedit/mod.rs#L516-L611
+    /// Taken from: <https://github.com/wez/wezterm/blob/e0b62d07ca9bf8ce69a61e30a3c20e7abc48ce7e/termwiz/src/lineedit/mod.rs#L516-L611>
     fn eval_movement(&self, movement: Movement) -> usize {
         match movement {
             Movement::BackwardChar(rep) => {
@@ -109,7 +133,7 @@ impl Prompt {
 
                     let mut found = None;
                     for prev in (0..char_position - 1).rev() {
-                        if char_indices[prev].1.is_whitespace() {
+                        if is_word_sep(char_indices[prev].1) {
                             found = Some(prev + 1);
                             break;
                         }
@@ -132,14 +156,14 @@ impl Prompt {
                 for _ in 0..rep {
                     // Skip any non-whitespace characters
                     while char_position < char_indices.len()
-                        && !char_indices[char_position].1.is_whitespace()
+                        && !is_word_sep(char_indices[char_position].1)
                     {
                         char_position += 1;
                     }
 
                     // Skip any whitespace characters
                     while char_position < char_indices.len()
-                        && char_indices[char_position].1.is_whitespace()
+                        && is_word_sep(char_indices[char_position].1)
                     {
                         char_position += 1;
                     }
@@ -177,19 +201,26 @@ impl Prompt {
         }
     }
 
-    pub fn insert_char(&mut self, c: char) {
+    pub fn insert_char(&mut self, c: char, cx: &Context) {
+        if let Some(handler) = &self.next_char_handler.take() {
+            handler(self, c, cx);
+
+            self.next_char_handler = None;
+            return;
+        }
+
         self.line.insert(self.cursor, c);
         let mut cursor = GraphemeCursor::new(self.cursor, self.line.len(), false);
         if let Ok(Some(pos)) = cursor.next_boundary(&self.line, 0) {
             self.cursor = pos;
         }
-        self.completion = (self.completion_fn)(&self.line);
-        self.exit_selection();
+        self.recalculate_completion(cx.editor);
     }
 
-    pub fn insert_str(&mut self, s: &str) {
+    pub fn insert_str(&mut self, s: &str, editor: &Editor) {
         self.line.insert_str(self.cursor, s);
         self.cursor += s.len();
+        self.recalculate_completion(editor);
     }
 
     pub fn move_cursor(&mut self, movement: Movement) {
@@ -205,84 +236,86 @@ impl Prompt {
         self.cursor = self.line.len();
     }
 
-    pub fn delete_char_backwards(&mut self) {
+    pub fn delete_char_backwards(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::BackwardChar(1));
         self.line.replace_range(pos..self.cursor, "");
         self.cursor = pos;
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn delete_char_forwards(&mut self) {
+    pub fn delete_char_forwards(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::ForwardChar(1));
         self.line.replace_range(self.cursor..pos, "");
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn delete_word_backwards(&mut self) {
+    pub fn delete_word_backwards(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::BackwardWord(1));
         self.line.replace_range(pos..self.cursor, "");
         self.cursor = pos;
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn delete_word_forwards(&mut self) {
+    pub fn delete_word_forwards(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::ForwardWord(1));
         self.line.replace_range(self.cursor..pos, "");
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn kill_to_start_of_line(&mut self) {
+    pub fn kill_to_start_of_line(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::StartOfLine);
         self.line.replace_range(pos..self.cursor, "");
         self.cursor = pos;
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn kill_to_end_of_line(&mut self) {
+    pub fn kill_to_end_of_line(&mut self, editor: &Editor) {
         let pos = self.eval_movement(Movement::EndOfLine);
         self.line.replace_range(self.cursor..pos, "");
 
-        self.exit_selection();
-        self.completion = (self.completion_fn)(&self.line);
+        self.recalculate_completion(editor);
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self, editor: &Editor) {
         self.line.clear();
         self.cursor = 0;
-        self.completion = (self.completion_fn)(&self.line);
-        self.exit_selection();
+        self.recalculate_completion(editor);
     }
 
-    pub fn change_history(&mut self, register: &[String], direction: CompletionDirection) {
-        if register.is_empty() {
-            return;
-        }
+    pub fn change_history(
+        &mut self,
+        cx: &mut Context,
+        register: char,
+        direction: CompletionDirection,
+    ) {
+        (self.callback_fn)(cx, &self.line, PromptEvent::Abort);
+        let values = match cx.editor.registers.read(register) {
+            Some(values) if !values.is_empty() => values,
+            _ => return,
+        };
 
-        let end = register.len().saturating_sub(1);
+        let end = values.len().saturating_sub(1);
 
         let index = match direction {
             CompletionDirection::Forward => self.history_pos.map_or(0, |i| i + 1),
             CompletionDirection::Backward => {
-                self.history_pos.unwrap_or(register.len()).saturating_sub(1)
+                self.history_pos.unwrap_or(values.len()).saturating_sub(1)
             }
         }
         .min(end);
 
-        self.line = register[index].clone();
+        self.line = values[index].clone();
 
         self.history_pos = Some(index);
 
         self.move_end();
+        (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+        self.recalculate_completion(cx.editor);
     }
 
     pub fn change_completion_selection(&mut self, direction: CompletionDirection) {
@@ -317,7 +350,7 @@ impl Prompt {
     pub fn render_prompt(&self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         let theme = &cx.editor.theme;
         let prompt_color = theme.get("ui.text");
-        let completion_color = theme.get("ui.statusline");
+        let completion_color = theme.get("ui.menu");
         let selected_color = theme.get("ui.menu.selected");
         // completion
 
@@ -330,7 +363,7 @@ impl Prompt {
             .max(BASE_WIDTH);
 
         let cols = std::cmp::max(1, area.width / max_len);
-        let col_width = (area.width - (cols)) / cols;
+        let col_width = (area.width.saturating_sub(cols)) / cols;
 
         let height = ((self.completion.len() as u16 + cols - 1) / cols)
             .min(10) // at most 10 rows (or less)
@@ -345,7 +378,7 @@ impl Prompt {
 
         if !self.completion.is_empty() {
             let area = completion_area;
-            let background = theme.get("ui.statusline");
+            let background = theme.get("ui.menu");
 
             let items = height as usize * cols as usize;
 
@@ -370,7 +403,7 @@ impl Prompt {
                 surface.set_stringn(
                     area.x + col * (1 + col_width),
                     area.y + row,
-                    &completion,
+                    completion,
                     col_width.saturating_sub(1) as usize,
                     color,
                 );
@@ -385,45 +418,68 @@ impl Prompt {
         if let Some(doc) = (self.doc_fn)(&self.line) {
             let mut text = ui::Text::new(doc.to_string());
 
+            let max_width = BASE_WIDTH * 3;
+            let padding = 1;
+
             let viewport = area;
+
+            let (_width, height) = ui::text::required_size(&text.contents, max_width);
+
             let area = viewport.intersection(Rect::new(
                 completion_area.x,
-                completion_area.y.saturating_sub(3),
-                BASE_WIDTH * 3,
-                3,
+                completion_area.y.saturating_sub(height + padding * 2),
+                max_width,
+                height + padding * 2,
             ));
 
             let background = theme.get("ui.help");
             surface.clear_with(area, background);
 
-            text.render(
-                area.inner(&Margin {
-                    vertical: 1,
-                    horizontal: 1,
-                }),
-                surface,
-                cx,
-            );
+            let block = Block::default()
+                // .title(self.title.as_str())
+                .borders(Borders::ALL)
+                .border_style(background);
+
+            let inner = block.inner(area).inner(&Margin::horizontal(1));
+
+            block.render(area, surface);
+            text.render(inner, surface, cx);
         }
 
         let line = area.height - 1;
         // render buffer text
         surface.set_string(area.x, area.y + line, &self.prompt, prompt_color);
+
+        let input: Cow<str> = if self.line.is_empty() {
+            // latest value in the register list
+            self.history_register
+                .and_then(|reg| cx.editor.registers.last(reg))
+                .map(|entry| entry.into())
+                .unwrap_or_else(|| Cow::from(""))
+        } else {
+            self.line.as_str().into()
+        };
+
         surface.set_string(
             area.x + self.prompt.len() as u16,
             area.y + line,
-            &self.line,
+            &input,
             prompt_color,
         );
     }
 }
 
 impl Component for Prompt {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let event = match event {
-            Event::Key(event) => event,
+            Event::Paste(data) => {
+                self.insert_str(data, cx.editor);
+                self.recalculate_completion(cx.editor);
+                return EventResult::Consumed(None);
+            }
+            Event::Key(event) => *event,
             Event::Resize(..) => return EventResult::Consumed(None),
-            _ => return EventResult::Ignored,
+            _ => return EventResult::Ignored(None),
         };
 
         let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
@@ -431,27 +487,29 @@ impl Component for Prompt {
             compositor.pop();
         })));
 
-        match event.into() {
+        match event {
             ctrl!('c') | key!(Esc) => {
                 (self.callback_fn)(cx, &self.line, PromptEvent::Abort);
                 return close_fn;
             }
-            alt!('b') | alt!(Left) => self.move_cursor(Movement::BackwardWord(1)),
-            alt!('f') | alt!(Right) => self.move_cursor(Movement::ForwardWord(1)),
+            alt!('b') | ctrl!(Left) => self.move_cursor(Movement::BackwardWord(1)),
+            alt!('f') | ctrl!(Right) => self.move_cursor(Movement::ForwardWord(1)),
             ctrl!('b') | key!(Left) => self.move_cursor(Movement::BackwardChar(1)),
             ctrl!('f') | key!(Right) => self.move_cursor(Movement::ForwardChar(1)),
             ctrl!('e') | key!(End) => self.move_end(),
             ctrl!('a') | key!(Home) => self.move_start(),
-            ctrl!('w') => self.delete_word_backwards(),
-            alt!('d') => self.delete_word_forwards(),
-            ctrl!('k') => self.kill_to_end_of_line(),
-            ctrl!('u') => self.kill_to_start_of_line(),
+            ctrl!('w') | alt!(Backspace) | ctrl!(Backspace) => {
+                self.delete_word_backwards(cx.editor)
+            }
+            alt!('d') | alt!(Delete) | ctrl!(Delete) => self.delete_word_forwards(cx.editor),
+            ctrl!('k') => self.kill_to_end_of_line(cx.editor),
+            ctrl!('u') => self.kill_to_start_of_line(cx.editor),
             ctrl!('h') | key!(Backspace) => {
-                self.delete_char_backwards();
+                self.delete_char_backwards(cx.editor);
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             ctrl!('d') | key!(Delete) => {
-                self.delete_char_forwards();
+                self.delete_char_forwards(cx.editor);
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             ctrl!('s') => {
@@ -468,41 +526,55 @@ impl Component for Prompt {
                 );
                 let line = text.slice(range.from()..range.to()).to_string();
                 if !line.is_empty() {
-                    self.insert_str(line.as_str());
+                    self.insert_str(line.as_str(), cx.editor);
                     (self.callback_fn)(cx, &self.line, PromptEvent::Update);
                 }
             }
             key!(Enter) => {
-                if self.selection.is_some() && self.line.ends_with('/') {
-                    self.completion = (self.completion_fn)(&self.line);
-                    self.exit_selection();
+                if self.selection.is_some() && self.line.ends_with(std::path::MAIN_SEPARATOR) {
+                    self.recalculate_completion(cx.editor);
                 } else {
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Validate);
+                    let last_item = self
+                        .history_register
+                        .and_then(|reg| cx.editor.registers.last(reg).cloned())
+                        .map(|entry| entry.into())
+                        .unwrap_or_else(|| Cow::from(""));
 
-                    if let Some(register) = self.history_register {
-                        // store in history
-                        let register = cx.editor.registers.get_mut(register);
-                        register.push(self.line.clone());
-                    }
+                    // handle executing with last command in history if nothing entered
+                    let input: Cow<str> = if self.line.is_empty() {
+                        last_item
+                    } else {
+                        if last_item != self.line {
+                            // store in history
+                            if let Some(register) = self.history_register {
+                                cx.editor.registers.push(register, self.line.clone());
+                            };
+                        }
+
+                        self.line.as_str().into()
+                    };
+
+                    (self.callback_fn)(cx, &input, PromptEvent::Validate);
+
                     return close_fn;
                 }
             }
             ctrl!('p') | key!(Up) => {
                 if let Some(register) = self.history_register {
-                    let register = cx.editor.registers.get_mut(register);
-                    self.change_history(register.read(), CompletionDirection::Backward);
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                    self.change_history(cx, register, CompletionDirection::Backward);
                 }
             }
             ctrl!('n') | key!(Down) => {
                 if let Some(register) = self.history_register {
-                    let register = cx.editor.registers.get_mut(register);
-                    self.change_history(register.read(), CompletionDirection::Forward);
-                    (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                    self.change_history(cx, register, CompletionDirection::Forward);
                 }
             }
             key!(Tab) => {
                 self.change_completion_selection(CompletionDirection::Forward);
+                // if single completion candidate is a directory list content in completion
+                if self.completion.len() == 1 && self.line.ends_with(std::path::MAIN_SEPARATOR) {
+                    self.recalculate_completion(cx.editor);
+                }
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update)
             }
             shift!(Tab) => {
@@ -510,12 +582,41 @@ impl Component for Prompt {
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update)
             }
             ctrl!('q') => self.exit_selection(),
-            // any char event that's not combined with control or mapped to any other combo
+            ctrl!('r') => {
+                self.completion = cx
+                    .editor
+                    .registers
+                    .inner()
+                    .iter()
+                    .map(|(ch, reg)| {
+                        let content = reg
+                            .read()
+                            .get(0)
+                            .and_then(|s| s.lines().next().to_owned())
+                            .unwrap_or_default();
+                        (0.., format!("{} {}", ch, &content).into())
+                    })
+                    .collect();
+                self.next_char_handler = Some(Box::new(|prompt, c, context| {
+                    prompt.insert_str(
+                        context
+                            .editor
+                            .registers
+                            .read(c)
+                            .and_then(|r| r.first())
+                            .map_or("", |r| r.as_str()),
+                        context.editor,
+                    );
+                }));
+                (self.callback_fn)(cx, &self.line, PromptEvent::Update);
+                return EventResult::Consumed(None);
+            }
+            // any char event that's not mapped to any other combo
             KeyEvent {
                 code: KeyCode::Char(c),
-                modifiers,
-            } if !modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
+                modifiers: _,
+            } => {
+                self.insert_char(c, cx);
                 (self.callback_fn)(cx, &self.line, PromptEvent::Update);
             }
             _ => (),

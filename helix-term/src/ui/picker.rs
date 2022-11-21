@@ -1,41 +1,65 @@
 use crate::{
-    compositor::{Component, Compositor, Context, EventResult},
+    compositor::{Component, Compositor, Context, Event, EventResult},
     ctrl, key, shift,
-    ui::EditorView,
+    ui::{self, fuzzy_match::FuzzyQuery, EditorView},
 };
-use crossterm::event::Event;
 use tui::{
     buffer::Buffer as Surface,
     widgets::{Block, BorderType, Borders},
 };
 
 use fuzzy_matcher::skim::SkimMatcherV2 as Matcher;
-use fuzzy_matcher::FuzzyMatcher;
 use tui::widgets::Widget;
 
-use std::{
-    borrow::Cow,
-    collections::HashMap,
-    io::Read,
-    path::{Path, PathBuf},
-};
+use std::{cmp::Ordering, time::Instant};
+use std::{collections::HashMap, io::Read, path::PathBuf};
 
 use crate::ui::{Prompt, PromptEvent};
-use helix_core::Position;
+use helix_core::{movement::Direction, Position};
 use helix_view::{
     editor::Action,
-    graphics::{Color, CursorKind, Margin, Rect, Style},
-    Document, Editor,
+    graphics::{CursorKind, Margin, Modifier, Rect},
+    Document, DocumentId, Editor,
 };
 
-pub const MIN_SCREEN_WIDTH_FOR_PREVIEW: u16 = 80;
+use super::menu::Item;
+
+pub const MIN_AREA_WIDTH_FOR_PREVIEW: u16 = 72;
 /// Biggest file size to preview in bytes
 pub const MAX_FILE_SIZE_FOR_PREVIEW: u64 = 10 * 1024 * 1024;
 
-/// File path and range of lines (used to align and highlight lines)
-type FileLocation = (PathBuf, Option<(usize, usize)>);
+#[derive(PartialEq, Eq, Hash)]
+pub enum PathOrId {
+    Id(DocumentId),
+    Path(PathBuf),
+}
 
-pub struct FilePicker<T> {
+impl PathOrId {
+    fn get_canonicalized(self) -> std::io::Result<Self> {
+        use PathOrId::*;
+        Ok(match self {
+            Path(path) => Path(helix_core::path::get_canonicalized_path(&path)?),
+            Id(id) => Id(id),
+        })
+    }
+}
+
+impl From<PathBuf> for PathOrId {
+    fn from(v: PathBuf) -> Self {
+        Self::Path(v)
+    }
+}
+
+impl From<DocumentId> for PathOrId {
+    fn from(v: DocumentId) -> Self {
+        Self::Id(v)
+    }
+}
+
+/// File path and range of lines (used to align and highlight lines)
+pub type FileLocation = (PathOrId, Option<(usize, usize)>);
+
+pub struct FilePicker<T: Item> {
     picker: Picker<T>,
     pub truncate_start: bool,
     /// Caches paths to documents
@@ -82,76 +106,116 @@ impl Preview<'_, '_> {
     }
 }
 
-impl<T> FilePicker<T> {
+impl<T: Item> FilePicker<T> {
     pub fn new(
         options: Vec<T>,
-        format_fn: impl Fn(&T) -> Cow<str> + 'static,
-        callback_fn: impl Fn(&mut Editor, &T, Action) + 'static,
+        editor_data: T::Data,
+        callback_fn: impl Fn(&mut Context, &T, Action) + 'static,
         preview_fn: impl Fn(&Editor, &T) -> Option<FileLocation> + 'static,
     ) -> Self {
+        let truncate_start = true;
+        let mut picker = Picker::new(options, editor_data, callback_fn);
+        picker.truncate_start = truncate_start;
+
         Self {
-            picker: Picker::new(false, options, format_fn, callback_fn),
-            truncate_start: true,
+            picker,
+            truncate_start,
             preview_cache: HashMap::new(),
             read_buffer: Vec::with_capacity(1024),
             file_fn: Box::new(preview_fn),
         }
     }
 
+    pub fn truncate_start(mut self, truncate_start: bool) -> Self {
+        self.truncate_start = truncate_start;
+        self.picker.truncate_start = truncate_start;
+        self
+    }
+
     fn current_file(&self, editor: &Editor) -> Option<FileLocation> {
         self.picker
             .selection()
             .and_then(|current| (self.file_fn)(editor, current))
-            .and_then(|(path, line)| {
-                helix_core::path::get_canonicalized_path(&path)
-                    .ok()
-                    .zip(Some(line))
-            })
+            .and_then(|(path_or_id, line)| path_or_id.get_canonicalized().ok().zip(Some(line)))
     }
 
     /// Get (cached) preview for a given path. If a document corresponding
     /// to the path is already open in the editor, it is used instead.
     fn get_preview<'picker, 'editor>(
         &'picker mut self,
-        path: &Path,
+        path_or_id: PathOrId,
         editor: &'editor Editor,
     ) -> Preview<'picker, 'editor> {
-        if let Some(doc) = editor.document_by_path(path) {
-            return Preview::EditorDocument(doc);
-        }
+        match path_or_id {
+            PathOrId::Path(path) => {
+                let path = &path;
+                if let Some(doc) = editor.document_by_path(path) {
+                    return Preview::EditorDocument(doc);
+                }
 
-        if self.preview_cache.contains_key(path) {
-            return Preview::Cached(&self.preview_cache[path]);
-        }
+                if self.preview_cache.contains_key(path) {
+                    return Preview::Cached(&self.preview_cache[path]);
+                }
 
-        let data = std::fs::File::open(path).and_then(|file| {
-            let metadata = file.metadata()?;
-            // Read up to 1kb to detect the content type
-            let n = file.take(1024).read_to_end(&mut self.read_buffer)?;
-            let content_type = content_inspector::inspect(&self.read_buffer[..n]);
-            self.read_buffer.clear();
-            Ok((metadata, content_type))
-        });
-        let preview = data
-            .map(
-                |(metadata, content_type)| match (metadata.len(), content_type) {
-                    (_, content_inspector::ContentType::BINARY) => CachedPreview::Binary,
-                    (size, _) if size > MAX_FILE_SIZE_FOR_PREVIEW => CachedPreview::LargeFile,
-                    _ => {
-                        // TODO: enable syntax highlighting; blocked by async rendering
-                        Document::open(path, None, Some(&editor.theme), None)
-                            .map(|doc| CachedPreview::Document(Box::new(doc)))
-                            .unwrap_or(CachedPreview::NotFound)
-                    }
+                let data = std::fs::File::open(path).and_then(|file| {
+                    let metadata = file.metadata()?;
+                    // Read up to 1kb to detect the content type
+                    let n = file.take(1024).read_to_end(&mut self.read_buffer)?;
+                    let content_type = content_inspector::inspect(&self.read_buffer[..n]);
+                    self.read_buffer.clear();
+                    Ok((metadata, content_type))
+                });
+                let preview = data
+                    .map(
+                        |(metadata, content_type)| match (metadata.len(), content_type) {
+                            (_, content_inspector::ContentType::BINARY) => CachedPreview::Binary,
+                            (size, _) if size > MAX_FILE_SIZE_FOR_PREVIEW => {
+                                CachedPreview::LargeFile
+                            }
+                            _ => {
+                                // TODO: enable syntax highlighting; blocked by async rendering
+                                Document::open(path, None, None)
+                                    .map(|doc| CachedPreview::Document(Box::new(doc)))
+                                    .unwrap_or(CachedPreview::NotFound)
+                            }
+                        },
+                    )
+                    .unwrap_or(CachedPreview::NotFound);
+                self.preview_cache.insert(path.to_owned(), preview);
+                Preview::Cached(&self.preview_cache[path])
+            }
+            PathOrId::Id(id) => {
+                let doc = editor.documents.get(&id).unwrap();
+                Preview::EditorDocument(doc)
+            }
+        }
+    }
+
+    fn handle_idle_timeout(&mut self, cx: &mut Context) -> EventResult {
+        // Try to find a document in the cache
+        let doc = self
+            .current_file(cx.editor)
+            .and_then(|(path, _range)| match path {
+                PathOrId::Id(doc_id) => Some(doc_mut!(cx.editor, &doc_id)),
+                PathOrId::Path(path) => match self.preview_cache.get_mut(&path) {
+                    Some(CachedPreview::Document(doc)) => Some(doc),
+                    _ => None,
                 },
-            )
-            .unwrap_or(CachedPreview::NotFound);
-        self.preview_cache.insert(path.to_owned(), preview);
-        Preview::Cached(&self.preview_cache[path])
+            });
+
+        // Then attempt to highlight it if it has no language set
+        if let Some(doc) = doc {
+            if doc.language_config().is_none() {
+                let loader = cx.editor.syn_loader.clone();
+                doc.detect_language(loader);
+            }
+        }
+
+        EventResult::Consumed(None)
     }
 }
 
-impl<T: 'static> Component for FilePicker<T> {
+impl<T: Item + 'static> Component for FilePicker<T> {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         // +---------+ +---------+
         // |prompt   | |preview  |
@@ -159,8 +223,8 @@ impl<T: 'static> Component for FilePicker<T> {
         // |picker   | |         |
         // |         | |         |
         // +---------+ +---------+
-        let render_preview = area.width > MIN_SCREEN_WIDTH_FOR_PREVIEW;
-        let area = inner_rect(area);
+
+        let render_preview = self.picker.show_preview && area.width > MIN_AREA_WIDTH_FOR_PREVIEW;
         // -- Render the frame:
         // clear area
         let background = cx.editor.theme.get("ui.background");
@@ -174,7 +238,6 @@ impl<T: 'static> Component for FilePicker<T> {
         };
 
         let picker_area = area.with_width(picker_width);
-        self.picker.truncate_start = self.truncate_start;
         self.picker.render(picker_area, surface, cx);
 
         if !render_preview {
@@ -189,15 +252,12 @@ impl<T: 'static> Component for FilePicker<T> {
         // calculate the inner area inside the box
         let inner = block.inner(preview_area);
         // 1 column gap on either side
-        let margin = Margin {
-            vertical: 0,
-            horizontal: 1,
-        };
+        let margin = Margin::horizontal(1);
         let inner = inner.inner(&margin);
         block.render(preview_area, surface);
 
         if let Some((path, range)) = self.current_file(cx.editor) {
-            let preview = self.get_preview(&path, cx.editor);
+            let preview = self.get_preview(path, cx.editor);
             let doc = match preview.document() {
                 Some(doc) => doc,
                 None => {
@@ -220,13 +280,14 @@ impl<T: 'static> Component for FilePicker<T> {
 
             let offset = Position::new(first_line, 0);
 
-            let highlights = EditorView::doc_syntax_highlights(
-                doc,
-                offset,
-                area.height,
-                &cx.editor.theme,
-                &cx.editor.syn_loader,
-            );
+            let mut highlights =
+                EditorView::doc_syntax_highlights(doc, offset, area.height, &cx.editor.theme);
+            for spans in EditorView::doc_diagnostics_highlights(doc, &cx.editor.theme) {
+                if spans.is_empty() {
+                    continue;
+                }
+                highlights = Box::new(helix_core::syntax::merge(highlights, spans));
+            }
             EditorView::render_text_highlights(
                 doc,
                 offset,
@@ -234,6 +295,7 @@ impl<T: 'static> Component for FilePicker<T> {
                 surface,
                 &cx.editor.theme,
                 highlights,
+                &cx.editor.config(),
             );
 
             // highlight the line
@@ -256,7 +318,10 @@ impl<T: 'static> Component for FilePicker<T> {
         }
     }
 
-    fn handle_event(&mut self, event: Event, ctx: &mut Context) -> EventResult {
+    fn handle_event(&mut self, event: &Event, ctx: &mut Context) -> EventResult {
+        if let Event::IdleTimeout = event {
+            return self.handle_idle_timeout(ctx);
+        }
         // TODO: keybinds for scrolling preview
         self.picker.handle_event(event, ctx)
     }
@@ -264,122 +329,229 @@ impl<T: 'static> Component for FilePicker<T> {
     fn cursor(&self, area: Rect, ctx: &Editor) -> (Option<Position>, CursorKind) {
         self.picker.cursor(area, ctx)
     }
+
+    fn required_size(&mut self, (width, height): (u16, u16)) -> Option<(u16, u16)> {
+        let picker_width = if width > MIN_AREA_WIDTH_FOR_PREVIEW {
+            width / 2
+        } else {
+            width
+        };
+        self.picker.required_size((picker_width, height))?;
+        Some((width, height))
+    }
 }
 
-pub struct Picker<T> {
+#[derive(PartialEq, Eq, Debug)]
+struct PickerMatch {
+    index: usize,
+    score: i64,
+    len: usize,
+}
+
+impl PartialOrd for PickerMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PickerMatch {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .cmp(&other.score)
+            .reverse()
+            .then_with(|| self.len.cmp(&other.len))
+    }
+}
+
+pub struct Picker<T: Item> {
     options: Vec<T>,
+    editor_data: T::Data,
     // filter: String,
     matcher: Box<Matcher>,
-    /// (index, score)
-    matches: Vec<(usize, i64)>,
-    /// Filter over original options.
-    filters: Vec<usize>, // could be optimized into bit but not worth it now
+    matches: Vec<PickerMatch>,
+
+    /// Current height of the completions box
+    completion_height: u16,
 
     cursor: usize,
     // pattern: String,
     prompt: Prompt,
-    /// Whether to render in the middle of the area
-    render_centered: bool,
-    /// Wheather to truncate the start (default true)
+    previous_pattern: String,
+    /// Whether to truncate the start (default true)
     pub truncate_start: bool,
+    /// Whether to show the preview panel (default true)
+    show_preview: bool,
 
-    format_fn: Box<dyn Fn(&T) -> Cow<str>>,
-    callback_fn: Box<dyn Fn(&mut Editor, &T, Action)>,
+    callback_fn: Box<dyn Fn(&mut Context, &T, Action)>,
 }
 
-impl<T> Picker<T> {
+impl<T: Item> Picker<T> {
     pub fn new(
-        render_centered: bool,
         options: Vec<T>,
-        format_fn: impl Fn(&T) -> Cow<str> + 'static,
-        callback_fn: impl Fn(&mut Editor, &T, Action) + 'static,
+        editor_data: T::Data,
+        callback_fn: impl Fn(&mut Context, &T, Action) + 'static,
     ) -> Self {
         let prompt = Prompt::new(
             "".into(),
             None,
-            |_pattern: &str| Vec::new(),
-            |_editor: &mut Context, _pattern: &str, _event: PromptEvent| {
-                //
-            },
+            ui::completers::none,
+            |_editor: &mut Context, _pattern: &str, _event: PromptEvent| {},
         );
 
         let mut picker = Self {
             options,
+            editor_data,
             matcher: Box::new(Matcher::default()),
             matches: Vec::new(),
-            filters: Vec::new(),
             cursor: 0,
             prompt,
-            render_centered,
+            previous_pattern: String::new(),
             truncate_start: true,
-            format_fn: Box::new(format_fn),
+            show_preview: true,
             callback_fn: Box::new(callback_fn),
+            completion_height: 0,
         };
 
-        // TODO: scoring on empty input should just use a fastpath
-        picker.score();
+        // scoring on empty input:
+        // TODO: just reuse score()
+        picker
+            .matches
+            .extend(picker.options.iter().enumerate().map(|(index, option)| {
+                let text = option.filter_text(&picker.editor_data);
+                PickerMatch {
+                    index,
+                    score: 0,
+                    len: text.chars().count(),
+                }
+            }));
 
         picker
     }
 
     pub fn score(&mut self) {
-        let pattern = &self.prompt.line;
+        let now = Instant::now();
 
-        // reuse the matches allocation
-        self.matches.clear();
-        self.matches.extend(
-            self.options
-                .iter()
-                .enumerate()
-                .filter_map(|(index, option)| {
-                    // filter options first before matching
-                    if !self.filters.is_empty() {
-                        self.filters.binary_search(&index).ok()?;
+        let pattern = self.prompt.line();
+
+        if pattern == &self.previous_pattern {
+            return;
+        }
+
+        if pattern.is_empty() {
+            // Fast path for no pattern.
+            self.matches.clear();
+            self.matches
+                .extend(self.options.iter().enumerate().map(|(index, option)| {
+                    let text = option.filter_text(&self.editor_data);
+                    PickerMatch {
+                        index,
+                        score: 0,
+                        len: text.chars().count(),
                     }
-                    // TODO: maybe using format_fn isn't the best idea here
-                    let text = (self.format_fn)(option);
-                    // TODO: using fuzzy_indices could give us the char idx for match highlighting
-                    self.matcher
-                        .fuzzy_match(&text, pattern)
-                        .map(|score| (index, score))
-                }),
-        );
-        self.matches.sort_unstable_by_key(|(_, score)| -score);
+                }));
+        } else if pattern.starts_with(&self.previous_pattern) {
+            let query = FuzzyQuery::new(pattern);
+            // optimization: if the pattern is a more specific version of the previous one
+            // then we can score the filtered set.
+            self.matches.retain_mut(|pmatch| {
+                let option = &self.options[pmatch.index];
+                let text = option.sort_text(&self.editor_data);
+
+                match query.fuzzy_match(&text, &self.matcher) {
+                    Some(s) => {
+                        // Update the score
+                        pmatch.score = s;
+                        true
+                    }
+                    None => false,
+                }
+            });
+
+            self.matches.sort_unstable();
+        } else {
+            let query = FuzzyQuery::new(pattern);
+            self.matches.clear();
+            self.matches.extend(
+                self.options
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, option)| {
+                        let text = option.filter_text(&self.editor_data);
+
+                        query
+                            .fuzzy_match(&text, &self.matcher)
+                            .map(|score| PickerMatch {
+                                index,
+                                score,
+                                len: text.chars().count(),
+                            })
+                    }),
+            );
+            self.matches.sort_unstable();
+        }
+
+        log::debug!("picker score {:?}", Instant::now().duration_since(now));
 
         // reset cursor position
         self.cursor = 0;
+        self.previous_pattern.clone_from(pattern);
     }
 
-    pub fn move_up(&mut self) {
-        if self.matches.is_empty() {
+    /// Move the cursor by a number of lines, either down (`Forward`) or up (`Backward`)
+    pub fn move_by(&mut self, amount: usize, direction: Direction) {
+        let len = self.matches.len();
+
+        if len == 0 {
+            // No results, can't move.
             return;
         }
-        let len = self.matches.len();
-        let pos = ((self.cursor + len.saturating_sub(1)) % len) % len;
-        self.cursor = pos;
+
+        match direction {
+            Direction::Forward => {
+                self.cursor = self.cursor.saturating_add(amount) % len;
+            }
+            Direction::Backward => {
+                self.cursor = self.cursor.saturating_add(len).saturating_sub(amount) % len;
+            }
+        }
     }
 
-    pub fn move_down(&mut self) {
-        if self.matches.is_empty() {
-            return;
-        }
-        let len = self.matches.len();
-        let pos = (self.cursor + 1) % len;
-        self.cursor = pos;
+    /// Move the cursor down by exactly one page. After the last page comes the first page.
+    pub fn page_up(&mut self) {
+        self.move_by(self.completion_height as usize, Direction::Backward);
+    }
+
+    /// Move the cursor up by exactly one page. After the first page comes the last page.
+    pub fn page_down(&mut self) {
+        self.move_by(self.completion_height as usize, Direction::Forward);
+    }
+
+    /// Move the cursor to the first entry
+    pub fn to_start(&mut self) {
+        self.cursor = 0;
+    }
+
+    /// Move the cursor to the last entry
+    pub fn to_end(&mut self) {
+        self.cursor = self.matches.len().saturating_sub(1);
     }
 
     pub fn selection(&self) -> Option<&T> {
         self.matches
             .get(self.cursor)
-            .map(|(index, _score)| &self.options[*index])
+            .map(|pmatch| &self.options[pmatch.index])
     }
 
-    pub fn save_filter(&mut self) {
-        self.filters.clear();
-        self.filters
-            .extend(self.matches.iter().map(|(index, _)| *index));
-        self.filters.sort_unstable(); // used for binary search later
-        self.prompt.clear();
+    pub fn toggle_preview(&mut self) {
+        self.show_preview = !self.show_preview;
+    }
+
+    fn prompt_handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
+        if let EventResult::Consumed(_) = self.prompt.handle_event(event, cx) {
+            // TODO: recalculate only if pattern changed
+            self.score();
+        }
+        EventResult::Consumed(None)
     }
 }
 
@@ -388,63 +560,73 @@ impl<T> Picker<T> {
 // - on input change:
 //  - score all the names in relation to input
 
-fn inner_rect(area: Rect) -> Rect {
-    let margin = Margin {
-        vertical: area.height * 10 / 100,
-        horizontal: area.width * 10 / 100,
-    };
-    area.inner(&margin)
-}
+impl<T: Item + 'static> Component for Picker<T> {
+    fn required_size(&mut self, viewport: (u16, u16)) -> Option<(u16, u16)> {
+        self.completion_height = viewport.1.saturating_sub(4);
+        Some(viewport)
+    }
 
-impl<T: 'static> Component for Picker<T> {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let key_event = match event {
-            Event::Key(event) => event,
+            Event::Key(event) => *event,
+            Event::Paste(..) => return self.prompt_handle_event(event, cx),
             Event::Resize(..) => return EventResult::Consumed(None),
-            _ => return EventResult::Ignored,
+            _ => return EventResult::Ignored(None),
         };
 
-        let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
+        let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _cx| {
             // remove the layer
             compositor.last_picker = compositor.pop();
         })));
 
-        match key_event.into() {
-            shift!(Tab) | key!(Up) | ctrl!('p') | ctrl!('k') => {
-                self.move_up();
+        // So that idle timeout retriggers
+        cx.editor.reset_idle_timer();
+
+        match key_event {
+            shift!(Tab) | key!(Up) | ctrl!('p') => {
+                self.move_by(1, Direction::Backward);
             }
-            key!(Tab) | key!(Down) | ctrl!('n') | ctrl!('j') => {
-                self.move_down();
+            key!(Tab) | key!(Down) | ctrl!('n') => {
+                self.move_by(1, Direction::Forward);
+            }
+            key!(PageDown) | ctrl!('d') => {
+                self.page_down();
+            }
+            key!(PageUp) | ctrl!('u') => {
+                self.page_up();
+            }
+            key!(Home) => {
+                self.to_start();
+            }
+            key!(End) => {
+                self.to_end();
             }
             key!(Esc) | ctrl!('c') => {
                 return close_fn;
             }
             key!(Enter) => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::Replace);
+                    (self.callback_fn)(cx, option, Action::Replace);
                 }
                 return close_fn;
             }
             ctrl!('s') => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::HorizontalSplit);
+                    (self.callback_fn)(cx, option, Action::HorizontalSplit);
                 }
                 return close_fn;
             }
             ctrl!('v') => {
                 if let Some(option) = self.selection() {
-                    (self.callback_fn)(cx.editor, option, Action::VerticalSplit);
+                    (self.callback_fn)(cx, option, Action::VerticalSplit);
                 }
                 return close_fn;
             }
-            ctrl!(' ') => {
-                self.save_filter();
+            ctrl!('t') => {
+                self.toggle_preview();
             }
             _ => {
-                if let EventResult::Consumed(_) = self.prompt.handle_event(event, cx) {
-                    // TODO: recalculate only if pattern changed
-                    self.score();
-                }
+                self.prompt_handle_event(event, cx);
             }
         }
 
@@ -452,13 +634,9 @@ impl<T: 'static> Component for Picker<T> {
     }
 
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
-        let area = if self.render_centered {
-            inner_rect(area)
-        } else {
-            area
-        };
-
         let text_style = cx.editor.theme.get("ui.text");
+        let selected = cx.editor.theme.get("ui.text.focus");
+        let highlighted = cx.editor.theme.get("special").add_modifier(Modifier::BOLD);
 
         // -- Render the frame:
         // clear area
@@ -489,52 +667,73 @@ impl<T: 'static> Component for Picker<T> {
         self.prompt.render(area, surface, cx);
 
         // -- Separator
-        let sep_style = Style::default().fg(Color::Rgb(90, 89, 119));
+        let sep_style = cx.editor.theme.get("ui.background.separator");
         let borders = BorderType::line_symbols(BorderType::Plain);
         for x in inner.left()..inner.right() {
-            surface
-                .get_mut(x, inner.y + 1)
-                .set_symbol(borders.horizontal)
-                .set_style(sep_style);
+            if let Some(cell) = surface.get_mut(x, inner.y + 1) {
+                cell.set_symbol(borders.horizontal).set_style(sep_style);
+            }
         }
 
         // -- Render the contents:
         // subtract area of prompt from top and current item marker " > " from left
         let inner = inner.clip_top(2).clip_left(3);
 
-        let selected = cx.editor.theme.get("ui.text.focus");
-
         let rows = inner.height;
-        let offset = self.cursor / (rows as usize) * (rows as usize);
+        let offset = self.cursor - (self.cursor % std::cmp::max(1, rows as usize));
 
-        let files = self.matches.iter().skip(offset).map(|(index, _score)| {
-            (index, self.options.get(*index).unwrap()) // get_unchecked
-        });
+        let files = self
+            .matches
+            .iter()
+            .skip(offset)
+            .map(|pmatch| (pmatch.index, self.options.get(pmatch.index).unwrap()));
 
         for (i, (_index, option)) in files.take(rows as usize).enumerate() {
-            if i == (self.cursor - offset) {
-                surface.set_string(inner.x - 2, inner.y + i as u16, ">", selected);
+            let is_active = i == (self.cursor - offset);
+            if is_active {
+                surface.set_string(
+                    inner.x.saturating_sub(3),
+                    inner.y + i as u16,
+                    " > ",
+                    selected,
+                );
+                surface.set_style(
+                    Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+                    selected,
+                );
             }
 
-            surface.set_string_truncated(
-                inner.x,
-                inner.y + i as u16,
-                (self.format_fn)(option),
-                inner.width as usize,
-                if i == (self.cursor - offset) {
-                    selected
-                } else {
-                    text_style
-                },
-                true,
-                self.truncate_start,
-            );
+            let spans = option.label(&self.editor_data);
+            let (_score, highlights) = FuzzyQuery::new(self.prompt.line())
+                .fuzzy_indicies(&String::from(&spans), &self.matcher)
+                .unwrap_or_default();
+
+            spans.0.into_iter().fold(inner, |pos, span| {
+                let new_x = surface
+                    .set_string_truncated(
+                        pos.x,
+                        pos.y + i as u16,
+                        &span.content,
+                        pos.width as usize,
+                        |idx| {
+                            if highlights.contains(&idx) {
+                                highlighted.patch(span.style)
+                            } else if is_active {
+                                selected.patch(span.style)
+                            } else {
+                                text_style.patch(span.style)
+                            }
+                        },
+                        true,
+                        self.truncate_start,
+                    )
+                    .0;
+                pos.clip_left(new_x - pos.x)
+            });
         }
     }
 
     fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
-        // TODO: this is mostly duplicate code
-        let area = inner_rect(area);
         let block = Block::default().borders(Borders::ALL);
         // calculate the inner area inside the box
         let inner = block.inner(area);

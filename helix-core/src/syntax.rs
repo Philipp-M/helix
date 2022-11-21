@@ -1,4 +1,5 @@
 use crate::{
+    auto_pairs::AutoPairs,
     chars::char_is_line_ending,
     diagnostic::Severity,
     regex::Regex,
@@ -6,21 +7,25 @@ use crate::{
     Rope, RopeSlice, Tendril,
 };
 
-pub use helix_syntax::get_language;
-
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
+use bitflags::bitflags;
+use slotmap::{DefaultKey as LayerId, HopSlotMap};
 
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, VecDeque},
     fmt,
+    mem::replace,
     path::Path,
+    str::FromStr,
     sync::Arc,
 };
 
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
+
+use helix_loader::grammar::{get_language, load_runtime_file};
 
 fn deserialize_regex<'de, D>(deserializer: D) -> Result<Option<Regex>, D::Error>
 where
@@ -40,10 +45,26 @@ where
         .transpose()
 }
 
+pub fn deserialize_auto_pairs<'de, D>(deserializer: D) -> Result<Option<AutoPairs>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<AutoPairConfig>::deserialize(deserializer)?.and_then(AutoPairConfig::into))
+}
+
+fn default_timeout() -> u64 {
+    20
+}
+
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub language: Vec<LanguageConfiguration>,
+}
+
+impl Default for Configuration {
+    fn default() -> Self {
+        crate::config::default_syntax_loader()
+    }
 }
 
 // largely based on tree-sitter/cli/src/loader.rs
@@ -52,20 +73,27 @@ pub struct Configuration {
 pub struct LanguageConfiguration {
     #[serde(rename = "name")]
     pub language_id: String, // c-sharp, rust
-    pub scope: String,           // source.rust
-    pub file_types: Vec<String>, // filename ends_with? <Gemfile, rb, etc>
+    pub scope: String,             // source.rust
+    pub file_types: Vec<FileType>, // filename extension or ends_with? <Gemfile, rb, etc>
     #[serde(default)]
     pub shebangs: Vec<String>, // interpreter(s) associated with language
-    pub roots: Vec<String>,      // these indicate project roots <.git, Cargo.toml>
+    pub roots: Vec<String>,        // these indicate project roots <.git, Cargo.toml>
     pub comment_token: Option<String>,
+    pub max_line_length: Option<usize>,
 
     #[serde(default, skip_serializing, deserialize_with = "deserialize_lsp_config")]
     pub config: Option<serde_json::Value>,
 
     #[serde(default)]
     pub auto_format: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub formatter: Option<FormatterConfiguration>,
+
     #[serde(default)]
     pub diagnostic_severity: Severity,
+
+    pub grammar: Option<String>, // tree-sitter grammar name, defaults to language_id
 
     // content_regex
     #[serde(default, skip_serializing, deserialize_with = "deserialize_regex")]
@@ -81,9 +109,92 @@ pub struct LanguageConfiguration {
     pub indent: Option<IndentationConfiguration>,
 
     #[serde(skip)]
-    pub(crate) indent_query: OnceCell<Option<IndentQuery>>,
+    pub(crate) indent_query: OnceCell<Option<Query>>,
     #[serde(skip)]
     pub(crate) textobject_query: OnceCell<Option<TextObjectQuery>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub debugger: Option<DebugAdapterConfig>,
+
+    /// Automatic insertion of pairs to parentheses, brackets,
+    /// etc. Defaults to true. Optionally, this can be a list of 2-tuples
+    /// to specify a list of characters to pair. This overrides the
+    /// global setting.
+    #[serde(default, skip_serializing, deserialize_with = "deserialize_auto_pairs")]
+    pub auto_pairs: Option<AutoPairs>,
+
+    pub rulers: Option<Vec<u16>>, // if set, override editor's rulers
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub enum FileType {
+    /// The extension of the file, either the `Path::extension` or the full
+    /// filename if the file does not have an extension.
+    Extension(String),
+    /// The suffix of a file. This is compared to a given file's absolute
+    /// path, so it can be used to detect files based on their directories.
+    Suffix(String),
+}
+
+impl Serialize for FileType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        match self {
+            FileType::Extension(extension) => serializer.serialize_str(extension),
+            FileType::Suffix(suffix) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("suffix", &suffix.replace(std::path::MAIN_SEPARATOR, "/"))?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for FileType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        struct FileTypeVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for FileTypeVisitor {
+            type Value = FileType;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("string or table")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(FileType::Extension(value.to_string()))
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                match map.next_entry::<String, String>()? {
+                    Some((key, suffix)) if key == "suffix" => Ok(FileType::Suffix(
+                        suffix.replace('/', &std::path::MAIN_SEPARATOR.to_string()),
+                    )),
+                    Some((key, _value)) => Err(serde::de::Error::custom(format!(
+                        "unknown key in `file-types` list: {}",
+                        key
+                    ))),
+                    None => Err(serde::de::Error::custom(
+                        "expected a `suffix` key in the `file-types` entry",
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(FileTypeVisitor)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -93,6 +204,72 @@ pub struct LanguageServerConfiguration {
     #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout: u64,
+    pub language_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct FormatterConfiguration {
+    pub command: String,
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct AdvancedCompletion {
+    pub name: Option<String>,
+    pub completion: Option<String>,
+    pub default: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case", untagged)]
+pub enum DebugConfigCompletion {
+    Named(String),
+    Advanced(AdvancedCompletion),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum DebugArgumentValue {
+    String(String),
+    Array(Vec<String>),
+    Boolean(bool),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DebugTemplate {
+    pub name: String,
+    pub request: String,
+    pub completion: Vec<DebugConfigCompletion>,
+    pub args: HashMap<String, DebugArgumentValue>,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct DebugAdapterConfig {
+    pub name: String,
+    pub transport: String,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub port_arg: Option<String>,
+    pub templates: Vec<DebugTemplate>,
+    #[serde(default)]
+    pub quirks: DebuggerQuirks,
+}
+
+// Different workarounds for adapters' differences
+#[derive(Debug, Default, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct DebuggerQuirks {
+    #[serde(default)]
+    pub absolute_paths: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -102,15 +279,47 @@ pub struct IndentationConfiguration {
     pub unit: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct IndentQuery {
-    #[serde(default)]
-    #[serde(skip_serializing_if = "HashSet::is_empty")]
-    pub indent: HashSet<String>,
-    #[serde(default)]
-    #[serde(skip_serializing_if = "HashSet::is_empty")]
-    pub outdent: HashSet<String>,
+/// Configuration for auto pairs
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields, untagged)]
+pub enum AutoPairConfig {
+    /// Enables or disables auto pairing. False means disabled. True means to use the default pairs.
+    Enable(bool),
+
+    /// The mappings of pairs.
+    Pairs(HashMap<char, char>),
+}
+
+impl Default for AutoPairConfig {
+    fn default() -> Self {
+        AutoPairConfig::Enable(true)
+    }
+}
+
+impl From<&AutoPairConfig> for Option<AutoPairs> {
+    fn from(auto_pair_config: &AutoPairConfig) -> Self {
+        match auto_pair_config {
+            AutoPairConfig::Enable(false) => None,
+            AutoPairConfig::Enable(true) => Some(AutoPairs::default()),
+            AutoPairConfig::Pairs(pairs) => Some(AutoPairs::new(pairs.iter())),
+        }
+    }
+}
+
+impl From<AutoPairConfig> for Option<AutoPairs> {
+    fn from(auto_pairs_config: AutoPairConfig) -> Self {
+        (&auto_pairs_config).into()
+    }
+}
+
+impl FromStr for AutoPairConfig {
+    type Err = std::str::ParseBoolError;
+
+    // only do bool parsing for runtime setting
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let enable: bool = s.parse()?;
+        Ok(AutoPairConfig::Enable(enable))
+    }
 }
 
 #[derive(Debug)]
@@ -118,94 +327,162 @@ pub struct TextObjectQuery {
     pub query: Query,
 }
 
+#[derive(Debug)]
+pub enum CapturedNode<'a> {
+    Single(Node<'a>),
+    /// Guaranteed to be not empty
+    Grouped(Vec<Node<'a>>),
+}
+
+impl<'a> CapturedNode<'a> {
+    pub fn start_byte(&self) -> usize {
+        match self {
+            Self::Single(n) => n.start_byte(),
+            Self::Grouped(ns) => ns[0].start_byte(),
+        }
+    }
+
+    pub fn end_byte(&self) -> usize {
+        match self {
+            Self::Single(n) => n.end_byte(),
+            Self::Grouped(ns) => ns.last().unwrap().end_byte(),
+        }
+    }
+
+    pub fn byte_range(&self) -> std::ops::Range<usize> {
+        self.start_byte()..self.end_byte()
+    }
+}
+
+/// The maximum number of in-progress matches a TS cursor can consider at once.
+/// This is set to a constant in order to avoid performance problems for medium to large files. Set with `set_match_limit`.
+/// Using such a limit means that we lose valid captures, so there is fundamentally a tradeoff here.
+///
+///
+/// Old tree sitter versions used a limit of 32 by default until this limit was removed in version `0.19.5` (must now be set manually).
+/// However, this causes performance issues for medium to large files.
+/// In helix, this problem caused treesitter motions to take multiple seconds to complete in medium-sized rust files (3k loc).
+///
+///
+/// Neovim also encountered this problem and reintroduced this limit after it was removed upstream
+/// (see <https://github.com/neovim/neovim/issues/14897> and <https://github.com/neovim/neovim/pull/14915>).
+/// The number used here is fundamentally a tradeoff between breaking some obscure edge cases and performance.
+///
+///
+/// Neovim chose 64 for this value somewhat arbitrarily (<https://github.com/neovim/neovim/pull/18397>).
+/// 64 is too low for some languages though. In particular, it breaks some highlighting for record fields in Erlang record definitions.
+/// This number can be increased if new syntax highlight breakages are found, as long as the performance penalty is not too high.
+const TREE_SITTER_MATCH_LIMIT: u32 = 256;
+
 impl TextObjectQuery {
     /// Run the query on the given node and return sub nodes which match given
     /// capture ("function.inside", "class.around", etc).
+    ///
+    /// Captures may contain multiple nodes by using quantifiers (+, *, etc),
+    /// and support for this is partial and could use improvement.
+    ///
+    /// ```query
+    /// (comment)+ @capture
+    ///
+    /// ; OR
+    /// (
+    ///   (comment)*
+    ///   .
+    ///   (function)
+    /// ) @capture
+    /// ```
     pub fn capture_nodes<'a>(
         &'a self,
         capture_name: &str,
         node: Node<'a>,
         slice: RopeSlice<'a>,
         cursor: &'a mut QueryCursor,
-    ) -> Option<impl Iterator<Item = Node<'a>>> {
-        let capture_idx = self.query.capture_index_for_name(capture_name)?;
-        let captures = cursor.captures(&self.query, node, RopeProvider(slice));
+    ) -> Option<impl Iterator<Item = CapturedNode<'a>>> {
+        self.capture_nodes_any(&[capture_name], node, slice, cursor)
+    }
 
-        captures
-            .filter_map(move |(mat, idx)| {
-                (mat.captures[idx].index == capture_idx).then(|| mat.captures[idx].node)
-            })
-            .into()
+    /// Find the first capture that exists out of all given `capture_names`
+    /// and return sub nodes that match this capture.
+    pub fn capture_nodes_any<'a>(
+        &'a self,
+        capture_names: &[&str],
+        node: Node<'a>,
+        slice: RopeSlice<'a>,
+        cursor: &'a mut QueryCursor,
+    ) -> Option<impl Iterator<Item = CapturedNode<'a>>> {
+        let capture_idx = capture_names
+            .iter()
+            .find_map(|cap| self.query.capture_index_for_name(cap))?;
+
+        cursor.set_match_limit(TREE_SITTER_MATCH_LIMIT);
+
+        let nodes = cursor
+            .captures(&self.query, node, RopeProvider(slice))
+            .filter_map(move |(mat, _)| {
+                let nodes: Vec<_> = mat
+                    .captures
+                    .iter()
+                    .filter_map(|cap| (cap.index == capture_idx).then(|| cap.node))
+                    .collect();
+
+                if nodes.len() > 1 {
+                    Some(CapturedNode::Grouped(nodes))
+                } else {
+                    nodes.into_iter().map(CapturedNode::Single).next()
+                }
+            });
+
+        Some(nodes)
     }
 }
 
-fn load_runtime_file(language: &str, filename: &str) -> Result<String, std::io::Error> {
-    let path = crate::RUNTIME_DIR
-        .join("queries")
-        .join(language)
-        .join(filename);
-    std::fs::read_to_string(&path)
-}
-
-fn read_query(language: &str, filename: &str) -> String {
+pub fn read_query(language: &str, filename: &str) -> String {
     static INHERITS_REGEX: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r";+\s*inherits\s*:?\s*([a-z_,()]+)\s*").unwrap());
+        Lazy::new(|| Regex::new(r";+\s*inherits\s*:?\s*([a-z_,()-]+)\s*").unwrap());
 
     let query = load_runtime_file(language, filename).unwrap_or_default();
 
-    // TODO: the collect() is not ideal
-    let inherits = INHERITS_REGEX
-        .captures_iter(&query)
-        .flat_map(|captures| {
+    // replaces all "; inherits <language>(,<language>)*" with the queries of the given language(s)
+    INHERITS_REGEX
+        .replace_all(&query, |captures: &regex::Captures| {
             captures[1]
                 .split(',')
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
+                .map(|language| format!("\n{}\n", read_query(language, filename)))
+                .collect::<String>()
         })
-        .collect::<Vec<_>>();
-
-    if inherits.is_empty() {
-        return query;
-    }
-
-    let mut queries = inherits
-        .iter()
-        .map(|language| read_query(language, filename))
-        .collect::<Vec<_>>();
-
-    queries.push(query);
-
-    queries.concat()
+        .to_string()
 }
 
 impl LanguageConfiguration {
     fn initialize_highlight(&self, scopes: &[String]) -> Option<Arc<HighlightConfiguration>> {
-        let language = self.language_id.to_ascii_lowercase();
-
-        let highlights_query = read_query(&language, "highlights.scm");
+        let highlights_query = read_query(&self.language_id, "highlights.scm");
         // always highlight syntax errors
         // highlights_query += "\n(ERROR) @error";
 
-        let injections_query = read_query(&language, "injections.scm");
-        let locals_query = read_query(&language, "locals.scm");
+        let injections_query = read_query(&self.language_id, "injections.scm");
+        let locals_query = read_query(&self.language_id, "locals.scm");
 
         if highlights_query.is_empty() {
             None
         } else {
-            let language = get_language(&crate::RUNTIME_DIR, &self.language_id)
-                .map_err(|e| log::info!("{}", e))
+            let language = get_language(self.grammar.as_deref().unwrap_or(&self.language_id))
+                .map_err(|err| {
+                    log::error!(
+                        "Failed to load tree-sitter parser for language {:?}: {}",
+                        self.language_id,
+                        err
+                    )
+                })
                 .ok()?;
             let config = HighlightConfiguration::new(
                 language,
                 &highlights_query,
                 &injections_query,
                 &locals_query,
-            );
+            )
+            .map_err(|err| log::error!("Could not parse queries for language {:?}. Are your grammars out of sync? Try running 'hx --grammar fetch' and 'hx --grammar build'. This query could not be parsed: {:?}", self.language_id, err))
+            .ok()?;
 
-            let config = match config {
-                Ok(config) => config,
-                Err(err) => panic!("{}", err),
-            }; // TODO: avoid panic
             config.configure(scopes);
             Some(Arc::new(config))
         }
@@ -227,25 +504,17 @@ impl LanguageConfiguration {
         self.highlight_config.get().is_some()
     }
 
-    pub fn indent_query(&self) -> Option<&IndentQuery> {
+    pub fn indent_query(&self) -> Option<&Query> {
         self.indent_query
-            .get_or_init(|| {
-                let language = self.language_id.to_ascii_lowercase();
-
-                let toml = load_runtime_file(&language, "indents.toml").ok()?;
-                toml::from_slice(toml.as_bytes()).ok()
-            })
+            .get_or_init(|| self.load_query("indents.scm"))
             .as_ref()
     }
 
     pub fn textobject_query(&self) -> Option<&TextObjectQuery> {
         self.textobject_query
-            .get_or_init(|| -> Option<TextObjectQuery> {
-                let lang_name = self.language_id.to_ascii_lowercase();
-                let query_text = read_query(&lang_name, "textobjects.scm");
-                let lang = self.highlight_config.get()?.as_ref()?.language;
-                let query = Query::new(lang, &query_text).ok()?;
-                Some(TextObjectQuery { query })
+            .get_or_init(|| {
+                self.load_query("textobjects.scm")
+                    .map(|query| TextObjectQuery { query })
             })
             .as_ref()
     }
@@ -253,22 +522,47 @@ impl LanguageConfiguration {
     pub fn scope(&self) -> &str {
         &self.scope
     }
+
+    fn load_query(&self, kind: &str) -> Option<Query> {
+        let query_text = read_query(&self.language_id, kind);
+        if query_text.is_empty() {
+            return None;
+        }
+        let lang = self.highlight_config.get()?.as_ref()?.language;
+        Query::new(lang, &query_text)
+            .map_err(|e| {
+                log::error!(
+                    "Failed to parse {} queries for {}: {}",
+                    kind,
+                    self.language_id,
+                    e
+                )
+            })
+            .ok()
+    }
 }
+
+// Expose loader as Lazy<> global since it's always static?
 
 #[derive(Debug)]
 pub struct Loader {
     // highlight_names ?
     language_configs: Vec<Arc<LanguageConfiguration>>,
-    language_config_ids_by_file_type: HashMap<String, usize>, // Vec<usize>
+    language_config_ids_by_extension: HashMap<String, usize>, // Vec<usize>
+    language_config_ids_by_suffix: HashMap<String, usize>,
     language_config_ids_by_shebang: HashMap<String, usize>,
+
+    scopes: ArcSwap<Vec<String>>,
 }
 
 impl Loader {
     pub fn new(config: Configuration) -> Self {
         let mut loader = Self {
             language_configs: Vec::new(),
-            language_config_ids_by_file_type: HashMap::new(),
+            language_config_ids_by_extension: HashMap::new(),
+            language_config_ids_by_suffix: HashMap::new(),
             language_config_ids_by_shebang: HashMap::new(),
+            scopes: ArcSwap::from_pointee(Vec::new()),
         };
 
         for config in config.language {
@@ -277,9 +571,14 @@ impl Loader {
 
             for file_type in &config.file_types {
                 // entry().or_insert(Vec::new).push(language_id);
-                loader
-                    .language_config_ids_by_file_type
-                    .insert(file_type.clone(), language_id);
+                match file_type {
+                    FileType::Extension(extension) => loader
+                        .language_config_ids_by_extension
+                        .insert(extension.clone(), language_id),
+                    FileType::Suffix(suffix) => loader
+                        .language_config_ids_by_suffix
+                        .insert(suffix.clone(), language_id),
+                };
             }
             for shebang in &config.shebangs {
                 loader
@@ -299,11 +598,22 @@ impl Loader {
         let configuration_id = path
             .file_name()
             .and_then(|n| n.to_str())
-            .and_then(|file_name| self.language_config_ids_by_file_type.get(file_name))
+            .and_then(|file_name| self.language_config_ids_by_extension.get(file_name))
             .or_else(|| {
                 path.extension()
                     .and_then(|extension| extension.to_str())
-                    .and_then(|extension| self.language_config_ids_by_file_type.get(extension))
+                    .and_then(|extension| self.language_config_ids_by_extension.get(extension))
+            })
+            .or_else(|| {
+                self.language_config_ids_by_suffix
+                    .iter()
+                    .find_map(|(file_type, id)| {
+                        if path.to_str()?.ends_with(file_type) {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
             });
 
         configuration_id.and_then(|&id| self.language_configs.get(id).cloned())
@@ -327,6 +637,13 @@ impl Loader {
         self.language_configs
             .iter()
             .find(|config| config.scope == scope)
+            .cloned()
+    }
+
+    pub fn language_config_for_language_id(&self, id: &str) -> Option<Arc<LanguageConfiguration>> {
+        self.language_configs
+            .iter()
+            .find(|config| config.language_id == id)
             .cloned()
     }
 
@@ -354,20 +671,32 @@ impl Loader {
         }
         None
     }
-    pub fn language_configs_iter(&self) -> impl Iterator<Item = &Arc<LanguageConfiguration>> {
+
+    pub fn language_configs(&self) -> impl Iterator<Item = &Arc<LanguageConfiguration>> {
         self.language_configs.iter()
+    }
+
+    pub fn set_scopes(&self, scopes: Vec<String>) {
+        self.scopes.store(Arc::new(scopes));
+
+        // Reconfigure existing grammars
+        for config in self
+            .language_configs
+            .iter()
+            .filter(|cfg| cfg.is_highlight_initialized())
+        {
+            config.reconfigure(&self.scopes());
+        }
+    }
+
+    pub fn scopes(&self) -> Guard<Arc<Vec<String>>> {
+        self.scopes.load()
     }
 }
 
 pub struct TsParser {
     parser: tree_sitter::Parser,
-    cursors: Vec<QueryCursor>,
-}
-
-impl fmt::Debug for TsParser {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TsParser").finish()
-    }
+    pub cursors: Vec<QueryCursor>,
 }
 
 // could also just use a pool, or a single instance?
@@ -380,50 +709,45 @@ thread_local! {
 
 #[derive(Debug)]
 pub struct Syntax {
-    config: Arc<HighlightConfiguration>,
-
-    root_layer: LanguageLayer,
+    layers: HopSlotMap<LayerId, LanguageLayer>,
+    root: LayerId,
+    loader: Arc<Loader>,
 }
 
 fn byte_range_to_str(range: std::ops::Range<usize>, source: RopeSlice) -> Cow<str> {
-    let start_char = source.byte_to_char(range.start);
-    let end_char = source.byte_to_char(range.end);
-    Cow::from(source.slice(start_char..end_char))
+    Cow::from(source.byte_slice(range))
 }
 
 impl Syntax {
-    // buffer, grammar, config, grammars, sync_timeout?
-    pub fn new(
-        /*language: Lang,*/ source: &Rope,
-        config: Arc<HighlightConfiguration>,
-    ) -> Self {
-        let root_layer = LanguageLayer { tree: None };
-
-        // track markers of injections
-        // track scope_descriptor: a Vec of scopes for item in tree
-
-        let mut syntax = Self {
-            // grammar,
+    pub fn new(source: &Rope, config: Arc<HighlightConfiguration>, loader: Arc<Loader>) -> Self {
+        let root_layer = LanguageLayer {
+            tree: None,
             config,
-            root_layer,
+            depth: 0,
+            flags: LayerUpdateFlags::empty(),
+            ranges: vec![Range {
+                start_byte: 0,
+                end_byte: usize::MAX,
+                start_point: Point::new(0, 0),
+                end_point: Point::new(usize::MAX, usize::MAX),
+            }],
         };
 
-        // update root layer
-        PARSER.with(|ts_parser| {
-            // TODO: handle the returned `Result` properly.
-            let _ = syntax.root_layer.parse(
-                &mut ts_parser.borrow_mut(),
-                &syntax.config,
-                source,
-                0,
-                vec![Range {
-                    start_byte: 0,
-                    end_byte: usize::MAX,
-                    start_point: Point::new(0, 0),
-                    end_point: Point::new(usize::MAX, usize::MAX),
-                }],
-            );
-        });
+        // track scope_descriptor: a Vec of scopes for item in tree
+
+        let mut layers = HopSlotMap::default();
+        let root = layers.insert(root_layer);
+
+        let mut syntax = Self {
+            root,
+            layers,
+            loader,
+        };
+
+        syntax
+            .update(source, source, &ChangeSet::new(source))
+            .unwrap();
+
         syntax
     }
 
@@ -433,32 +757,276 @@ impl Syntax {
         source: &Rope,
         changeset: &ChangeSet,
     ) -> Result<(), Error> {
+        let mut queue = VecDeque::new();
+        queue.push_back(self.root);
+
+        let scopes = self.loader.scopes.load();
+        let injection_callback = |language: &str| {
+            self.loader
+                .language_configuration_for_injection_string(language)
+                .and_then(|language_config| language_config.highlight_config(&scopes))
+        };
+
+        // Convert the changeset into tree sitter edits.
+        let edits = generate_edits(old_source, changeset);
+
+        // Use the edits to update all layers markers
+        if !edits.is_empty() {
+            fn point_add(a: Point, b: Point) -> Point {
+                if b.row > 0 {
+                    Point::new(a.row.saturating_add(b.row), b.column)
+                } else {
+                    Point::new(0, a.column.saturating_add(b.column))
+                }
+            }
+            fn point_sub(a: Point, b: Point) -> Point {
+                if a.row > b.row {
+                    Point::new(a.row.saturating_sub(b.row), a.column)
+                } else {
+                    Point::new(0, a.column.saturating_sub(b.column))
+                }
+            }
+
+            for layer in self.layers.values_mut() {
+                // The root layer always covers the whole range (0..usize::MAX)
+                if layer.depth == 0 {
+                    layer.flags = LayerUpdateFlags::MODIFIED;
+                    continue;
+                }
+
+                for range in &mut layer.ranges {
+                    // Roughly based on https://github.com/tree-sitter/tree-sitter/blob/ddeaa0c7f534268b35b4f6cb39b52df082754413/lib/src/subtree.c#L691-L720
+                    for edit in edits.iter().rev() {
+                        let is_pure_insertion = edit.old_end_byte == edit.start_byte;
+
+                        // if edit is after range, skip
+                        if edit.start_byte > range.end_byte {
+                            // TODO: || (is_noop && edit.start_byte == range.end_byte)
+                            continue;
+                        }
+
+                        // if edit is before range, shift entire range by len
+                        if edit.old_end_byte < range.start_byte {
+                            range.start_byte =
+                                edit.new_end_byte + (range.start_byte - edit.old_end_byte);
+                            range.start_point = point_add(
+                                edit.new_end_position,
+                                point_sub(range.start_point, edit.old_end_position),
+                            );
+
+                            range.end_byte = edit
+                                .new_end_byte
+                                .saturating_add(range.end_byte - edit.old_end_byte);
+                            range.end_point = point_add(
+                                edit.new_end_position,
+                                point_sub(range.end_point, edit.old_end_position),
+                            );
+
+                            layer.flags |= LayerUpdateFlags::MOVED;
+                        }
+                        // if the edit starts in the space before and extends into the range
+                        else if edit.start_byte < range.start_byte {
+                            range.start_byte = edit.new_end_byte;
+                            range.start_point = edit.new_end_position;
+
+                            range.end_byte = range
+                                .end_byte
+                                .saturating_sub(edit.old_end_byte)
+                                .saturating_add(edit.new_end_byte);
+                            range.end_point = point_add(
+                                edit.new_end_position,
+                                point_sub(range.end_point, edit.old_end_position),
+                            );
+                            layer.flags = LayerUpdateFlags::MODIFIED;
+                        }
+                        // If the edit is an insertion at the start of the tree, shift
+                        else if edit.start_byte == range.start_byte && is_pure_insertion {
+                            range.start_byte = edit.new_end_byte;
+                            range.start_point = edit.new_end_position;
+                            layer.flags |= LayerUpdateFlags::MOVED;
+                        } else {
+                            range.end_byte = range
+                                .end_byte
+                                .saturating_sub(edit.old_end_byte)
+                                .saturating_add(edit.new_end_byte);
+                            range.end_point = point_add(
+                                edit.new_end_position,
+                                point_sub(range.end_point, edit.old_end_position),
+                            );
+                            layer.flags = LayerUpdateFlags::MODIFIED;
+                        }
+                    }
+                }
+            }
+        }
+
         PARSER.with(|ts_parser| {
-            self.root_layer.update(
-                &mut ts_parser.borrow_mut(),
-                &self.config,
-                old_source,
-                source,
-                changeset,
-            )
+            let ts_parser = &mut ts_parser.borrow_mut();
+            let mut cursor = ts_parser.cursors.pop().unwrap_or_else(QueryCursor::new);
+            // TODO: might need to set cursor range
+            cursor.set_byte_range(0..usize::MAX);
+            cursor.set_match_limit(TREE_SITTER_MATCH_LIMIT);
+
+            let source_slice = source.slice(..);
+
+            while let Some(layer_id) = queue.pop_front() {
+                let layer = &mut self.layers[layer_id];
+
+                // Mark the layer as touched
+                layer.flags |= LayerUpdateFlags::TOUCHED;
+
+                // If a tree already exists, notify it of changes.
+                if let Some(tree) = &mut layer.tree {
+                    if layer
+                        .flags
+                        .intersects(LayerUpdateFlags::MODIFIED | LayerUpdateFlags::MOVED)
+                    {
+                        for edit in edits.iter().rev() {
+                            // Apply the edits in reverse.
+                            // If we applied them in order then edit 1 would disrupt the positioning of edit 2.
+                            tree.edit(edit);
+                        }
+                    }
+
+                    if layer.flags.contains(LayerUpdateFlags::MODIFIED) {
+                        // Re-parse the tree.
+                        layer.parse(&mut ts_parser.parser, source)?;
+                    }
+                } else {
+                    // always parse if this layer has never been parsed before
+                    layer.parse(&mut ts_parser.parser, source)?;
+                }
+
+                // Switch to an immutable borrow.
+                let layer = &self.layers[layer_id];
+
+                // Process injections.
+                let matches = cursor.matches(
+                    &layer.config.injections_query,
+                    layer.tree().root_node(),
+                    RopeProvider(source_slice),
+                );
+                let mut injections = Vec::new();
+                for mat in matches {
+                    let (language_name, content_node, included_children) = injection_for_match(
+                        &layer.config,
+                        &layer.config.injections_query,
+                        &mat,
+                        source_slice,
+                    );
+
+                    // Explicitly remove this match so that none of its other captures will remain
+                    // in the stream of captures.
+                    mat.remove();
+
+                    // If a language is found with the given name, then add a new language layer
+                    // to the highlighted document.
+                    if let (Some(language_name), Some(content_node)) = (language_name, content_node)
+                    {
+                        if let Some(config) = (injection_callback)(&language_name) {
+                            let ranges =
+                                intersect_ranges(&layer.ranges, &[content_node], included_children);
+
+                            if !ranges.is_empty() {
+                                injections.push((config, ranges));
+                            }
+                        }
+                    }
+                }
+
+                // Process combined injections.
+                if let Some(combined_injections_query) = &layer.config.combined_injections_query {
+                    let mut injections_by_pattern_index =
+                        vec![
+                            (None, Vec::new(), IncludedChildren::default());
+                            combined_injections_query.pattern_count()
+                        ];
+                    let matches = cursor.matches(
+                        combined_injections_query,
+                        layer.tree().root_node(),
+                        RopeProvider(source_slice),
+                    );
+                    for mat in matches {
+                        let entry = &mut injections_by_pattern_index[mat.pattern_index];
+                        let (language_name, content_node, included_children) = injection_for_match(
+                            &layer.config,
+                            combined_injections_query,
+                            &mat,
+                            source_slice,
+                        );
+                        if language_name.is_some() {
+                            entry.0 = language_name;
+                        }
+                        if let Some(content_node) = content_node {
+                            entry.1.push(content_node);
+                        }
+                        entry.2 = included_children;
+                    }
+                    for (lang_name, content_nodes, included_children) in injections_by_pattern_index
+                    {
+                        if let (Some(lang_name), false) = (lang_name, content_nodes.is_empty()) {
+                            if let Some(config) = (injection_callback)(&lang_name) {
+                                let ranges = intersect_ranges(
+                                    &layer.ranges,
+                                    &content_nodes,
+                                    included_children,
+                                );
+                                if !ranges.is_empty() {
+                                    injections.push((config, ranges));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let depth = layer.depth + 1;
+                // TODO: can't inline this since matches borrows self.layers
+                for (config, ranges) in injections {
+                    // Find an existing layer
+                    let layer = self
+                        .layers
+                        .iter_mut()
+                        .find(|(_, layer)| {
+                            layer.depth == depth && // TODO: track parent id instead
+                            layer.config.language == config.language && layer.ranges == ranges
+                        })
+                        .map(|(id, _layer)| id);
+
+                    // ...or insert a new one.
+                    let layer_id = layer.unwrap_or_else(|| {
+                        self.layers.insert(LanguageLayer {
+                            tree: None,
+                            config,
+                            depth,
+                            ranges,
+                            // set the modified flag to ensure the layer is parsed
+                            flags: LayerUpdateFlags::empty(),
+                        })
+                    });
+
+                    queue.push_back(layer_id);
+                }
+
+                // TODO: pre-process local scopes at this time, rather than highlight?
+                // would solve problems with locals not working across boundaries
+            }
+
+            // Return the cursor back in the pool.
+            ts_parser.cursors.push(cursor);
+
+            // Reset all `LayerUpdateFlags` and remove all untouched layers
+            self.layers.retain(|_, layer| {
+                replace(&mut layer.flags, LayerUpdateFlags::empty())
+                    .contains(LayerUpdateFlags::TOUCHED)
+            });
+
+            Ok(())
         })
-
-        // TODO: deal with injections and update them too
     }
 
-    // fn buffer_changed -> call layer.update(range, new_text) on root layer and then all marker layers
-
-    // call this on transaction.apply() -> buffer_changed(changes)
-    //
-    // fn parse(language, old_tree, ranges)
-    //
     pub fn tree(&self) -> &Tree {
-        self.root_layer.tree()
+        self.layers[self.root].tree()
     }
-    //
-    // <!--update_for_injection(grammar)-->
-
-    // Highlighting
 
     /// Iterate over the highlighted regions for a given slice of source code.
     pub fn highlight_iter<'a>(
@@ -466,65 +1034,77 @@ impl Syntax {
         source: RopeSlice<'a>,
         range: Option<std::ops::Range<usize>>,
         cancellation_flag: Option<&'a AtomicUsize>,
-        injection_callback: impl FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
     ) -> impl Iterator<Item = Result<HighlightEvent, Error>> + 'a {
-        // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
-        // prevents them from being moved. But both of these values are really just
-        // pointers, so it's actually ok to move them.
+        let mut layers = self
+            .layers
+            .iter()
+            .filter_map(|(_, layer)| {
+                // TODO: if range doesn't overlap layer range, skip it
 
-        // reuse a cursor from the pool if possible
-        let mut cursor = PARSER.with(|ts_parser| {
-            let highlighter = &mut ts_parser.borrow_mut();
-            highlighter.cursors.pop().unwrap_or_else(QueryCursor::new)
+                // Reuse a cursor from the pool if available.
+                let mut cursor = PARSER.with(|ts_parser| {
+                    let highlighter = &mut ts_parser.borrow_mut();
+                    highlighter.cursors.pop().unwrap_or_else(QueryCursor::new)
+                });
+
+                // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
+                // prevents them from being moved. But both of these values are really just
+                // pointers, so it's actually ok to move them.
+                let cursor_ref =
+                    unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
+
+                // if reusing cursors & no range this resets to whole range
+                cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
+                cursor_ref.set_match_limit(TREE_SITTER_MATCH_LIMIT);
+
+                let mut captures = cursor_ref
+                    .captures(
+                        &layer.config.query,
+                        layer.tree().root_node(),
+                        RopeProvider(source),
+                    )
+                    .peekable();
+
+                // If there's no captures, skip the layer
+                captures.peek()?;
+
+                Some(HighlightIterLayer {
+                    highlight_end_stack: Vec::new(),
+                    scope_stack: vec![LocalScope {
+                        inherits: false,
+                        range: 0..usize::MAX,
+                        local_defs: Vec::new(),
+                    }],
+                    cursor,
+                    _tree: None,
+                    captures,
+                    config: layer.config.as_ref(), // TODO: just reuse `layer`
+                    depth: layer.depth,            // TODO: just reuse `layer`
+                    ranges: &layer.ranges,         // TODO: temp
+                })
+            })
+            .collect::<Vec<_>>();
+
+        // HAXX: arrange layers by byte range, with deeper layers positioned first
+        layers.sort_by_key(|layer| {
+            (
+                layer.ranges.first().cloned(),
+                std::cmp::Reverse(layer.depth),
+            )
         });
-        let tree_ref = self.tree();
-        let cursor_ref = unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
-        let query_ref = &self.config.query;
-        let config_ref = self.config.as_ref();
-
-        // if reusing cursors & no range this resets to whole range
-        cursor_ref.set_byte_range(range.clone().unwrap_or(0..usize::MAX));
-
-        let captures = cursor_ref
-            .captures(query_ref, tree_ref.root_node(), RopeProvider(source))
-            .peekable();
-
-        // manually craft the root layer based on the existing tree
-        let layer = HighlightIterLayer {
-            highlight_end_stack: Vec::new(),
-            scope_stack: vec![LocalScope {
-                inherits: false,
-                range: 0..usize::MAX,
-                local_defs: Vec::new(),
-            }],
-            cursor,
-            depth: 0,
-            _tree: None,
-            captures,
-            config: config_ref,
-            ranges: vec![Range {
-                start_byte: 0,
-                end_byte: usize::MAX,
-                start_point: Point::new(0, 0),
-                end_point: Point::new(usize::MAX, usize::MAX),
-            }],
-        };
 
         let mut result = HighlightIter {
             source,
-            byte_offset: range.map_or(0, |r| r.start), // TODO: simplify
-            injection_callback,
+            byte_offset: range.map_or(0, |r| r.start),
             cancellation_flag,
             iter_count: 0,
-            layers: vec![layer],
+            layers,
             next_event: None,
             last_highlight_range: None,
         };
         result.sort_layers();
         result
     }
-    // on_tokenize
-    // on_change_highlighting
 
     // Commenting
     // comment_strings_for_pos
@@ -536,251 +1116,175 @@ impl Syntax {
     // indent_level_for_line
 
     // TODO: Folding
+}
 
-    // Syntax APIs
-    // get_syntax_node_containing_range ->
-    // ...
-    // get_syntax_node_at_pos
-    // buffer_range_for_scope_at_pos
+bitflags! {
+    /// Flags that track the status of a layer
+    /// in the `Sytaxn::update` function
+    struct LayerUpdateFlags : u32{
+        const MODIFIED = 0b001;
+        const MOVED = 0b010;
+        const TOUCHED = 0b100;
+    }
 }
 
 #[derive(Debug)]
 pub struct LanguageLayer {
     // mode
     // grammar
-    // depth
+    pub config: Arc<HighlightConfiguration>,
     pub(crate) tree: Option<Tree>,
+    pub ranges: Vec<Range>,
+    pub depth: u32,
+    flags: LayerUpdateFlags,
 }
 
 impl LanguageLayer {
-    // pub fn new() -> Self {
-    //     Self { tree: None }
-    // }
-
     pub fn tree(&self) -> &Tree {
         // TODO: no unwrap
         self.tree.as_ref().unwrap()
     }
 
-    fn parse(
-        &mut self,
-        ts_parser: &mut TsParser,
-        config: &HighlightConfiguration,
-        source: &Rope,
-        _depth: usize,
-        ranges: Vec<Range>,
-    ) -> Result<(), Error> {
-        if ts_parser.parser.set_included_ranges(&ranges).is_ok() {
-            ts_parser
-                .parser
-                .set_language(config.language)
-                .map_err(|_| Error::InvalidLanguage)?;
+    fn parse(&mut self, parser: &mut Parser, source: &Rope) -> Result<(), Error> {
+        parser
+            .set_included_ranges(&self.ranges)
+            .map_err(|_| Error::InvalidRanges)?;
 
-            // unsafe { syntax.parser.set_cancellation_flag(cancellation_flag) };
-            let tree = ts_parser
-                .parser
-                .parse_with(
-                    &mut |byte, _| {
-                        if byte <= source.len_bytes() {
-                            let (chunk, start_byte, _, _) = source.chunk_at_byte(byte);
-                            chunk[byte - start_byte..].as_bytes()
-                        } else {
-                            // out of range
-                            &[]
-                        }
-                    },
-                    self.tree.as_ref(),
-                )
-                .ok_or(Error::Cancelled)?;
+        parser
+            .set_language(self.config.language)
+            .map_err(|_| Error::InvalidLanguage)?;
 
-            self.tree = Some(tree)
-        }
+        // unsafe { syntax.parser.set_cancellation_flag(cancellation_flag) };
+        let tree = parser
+            .parse_with(
+                &mut |byte, _| {
+                    if byte <= source.len_bytes() {
+                        let (chunk, start_byte, _, _) = source.chunk_at_byte(byte);
+                        chunk[byte - start_byte..].as_bytes()
+                    } else {
+                        // out of range
+                        &[]
+                    }
+                },
+                self.tree.as_ref(),
+            )
+            .ok_or(Error::Cancelled)?;
+        // unsafe { ts_parser.parser.set_cancellation_flag(None) };
+        self.tree = Some(tree);
         Ok(())
     }
-
-    pub(crate) fn generate_edits(
-        old_text: RopeSlice,
-        changeset: &ChangeSet,
-    ) -> Vec<tree_sitter::InputEdit> {
-        use Operation::*;
-        let mut old_pos = 0;
-
-        let mut edits = Vec::new();
-
-        let mut iter = changeset.changes.iter().peekable();
-
-        // TODO; this is a lot easier with Change instead of Operation.
-
-        fn point_at_pos(text: RopeSlice, pos: usize) -> (usize, Point) {
-            let byte = text.char_to_byte(pos); // <- attempted to index past end
-            let line = text.char_to_line(pos);
-            let line_start_byte = text.line_to_byte(line);
-            let col = byte - line_start_byte;
-
-            (byte, Point::new(line, col))
-        }
-
-        fn traverse(point: Point, text: &Tendril) -> Point {
-            let Point {
-                mut row,
-                mut column,
-            } = point;
-
-            // TODO: there should be a better way here.
-            let mut chars = text.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if char_is_line_ending(ch) && !(ch == '\r' && chars.peek() == Some(&'\n')) {
-                    row += 1;
-                    column = 0;
-                } else {
-                    column += 1;
-                }
-            }
-            Point { row, column }
-        }
-
-        while let Some(change) = iter.next() {
-            let len = match change {
-                Delete(i) | Retain(i) => *i,
-                Insert(_) => 0,
-            };
-            let mut old_end = old_pos + len;
-
-            match change {
-                Retain(_) => {}
-                Delete(_) => {
-                    let (start_byte, start_position) = point_at_pos(old_text, old_pos);
-                    let (old_end_byte, old_end_position) = point_at_pos(old_text, old_end);
-
-                    // TODO: Position also needs to be byte based...
-                    // let byte = char_to_byte(old_pos)
-                    // let line = char_to_line(old_pos)
-                    // let line_start_byte = line_to_byte()
-                    // Position::new(line, line_start_byte - byte)
-
-                    // deletion
-                    edits.push(tree_sitter::InputEdit {
-                        start_byte,                       // old_pos to byte
-                        old_end_byte,                     // old_end to byte
-                        new_end_byte: start_byte,         // old_pos to byte
-                        start_position,                   // old pos to coords
-                        old_end_position,                 // old_end to coords
-                        new_end_position: start_position, // old pos to coords
-                    });
-                }
-                Insert(s) => {
-                    let (start_byte, start_position) = point_at_pos(old_text, old_pos);
-
-                    // a subsequent delete means a replace, consume it
-                    if let Some(Delete(len)) = iter.peek() {
-                        old_end = old_pos + len;
-                        let (old_end_byte, old_end_position) = point_at_pos(old_text, old_end);
-
-                        iter.next();
-
-                        // replacement
-                        edits.push(tree_sitter::InputEdit {
-                            start_byte,                                    // old_pos to byte
-                            old_end_byte,                                  // old_end to byte
-                            new_end_byte: start_byte + s.len(), // old_pos to byte + s.len()
-                            start_position,                     // old pos to coords
-                            old_end_position,                   // old_end to coords
-                            new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
-                        });
-                    } else {
-                        // insert
-                        edits.push(tree_sitter::InputEdit {
-                            start_byte,                                    // old_pos to byte
-                            old_end_byte: start_byte,                      // same
-                            new_end_byte: start_byte + s.len(),            // old_pos + s.len()
-                            start_position,                                // old pos to coords
-                            old_end_position: start_position,              // same
-                            new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
-                        });
-                    }
-                }
-            }
-            old_pos = old_end;
-        }
-        edits
-    }
-
-    fn update(
-        &mut self,
-        ts_parser: &mut TsParser,
-        config: &HighlightConfiguration,
-        old_source: &Rope,
-        source: &Rope,
-        changeset: &ChangeSet,
-    ) -> Result<(), Error> {
-        if changeset.is_empty() {
-            return Ok(());
-        }
-
-        let edits = Self::generate_edits(old_source.slice(..), changeset);
-
-        // Notify the tree about all the changes
-        for edit in edits.iter().rev() {
-            // apply the edits in reverse. If we applied them in order then edit 1 would disrupt
-            // the positioning of edit 2
-            self.tree.as_mut().unwrap().edit(edit);
-        }
-
-        self.parse(
-            ts_parser,
-            config,
-            source,
-            0,
-            // TODO: what to do about this range on update
-            vec![Range {
-                start_byte: 0,
-                end_byte: usize::MAX,
-                start_point: Point::new(0, 0),
-                end_point: Point::new(usize::MAX, usize::MAX),
-            }],
-        )
-    }
-
-    // fn highlight_iter() -> same as Mode but for this layer. Mode composits these
-    // fn buffer_changed
-    // fn update(range)
-    // fn update_injections()
 }
 
-// -- refactored from tree-sitter-highlight to be able to retain state
-// TODO: add seek() to iter
+pub(crate) fn generate_edits(
+    old_text: &Rope,
+    changeset: &ChangeSet,
+) -> Vec<tree_sitter::InputEdit> {
+    use Operation::*;
+    let mut old_pos = 0;
 
-// problem: any time a layer is updated it must update it's injections on the parent (potentially
-// removing some from use)
-// can't modify to vec and exist in it at the same time since that would violate borrows
-// maybe we can do with an arena
-// maybe just caching on the top layer and nevermind the injections for now?
-//
-// Grammar {
-//  layers: Vec<Box<Layer>> to prevent memory moves when vec is modified
-// }
-// injections tracked by marker:
-// if marker areas match it's fine and update
-// if not found add new layer
-// if length 0 then area got removed, clean up the layer
-//
-// layer update:
-// if range.len = 0 then remove the layer
-// for change in changes { tree.edit(change) }
-// tree = parser.parse(.., tree, ..)
-// calculate affected range and update injections
-// injection update:
-// look for existing injections
-// if present, range = (first injection start, last injection end)
-//
-// For now cheat and just throw out non-root layers if they exist. This should still improve
-// parsing in majority of cases.
+    let mut edits = Vec::new();
+
+    if changeset.changes.is_empty() {
+        return edits;
+    }
+
+    let mut iter = changeset.changes.iter().peekable();
+
+    // TODO; this is a lot easier with Change instead of Operation.
+
+    fn point_at_pos(text: &Rope, pos: usize) -> (usize, Point) {
+        let byte = text.char_to_byte(pos); // <- attempted to index past end
+        let line = text.char_to_line(pos);
+        let line_start_byte = text.line_to_byte(line);
+        let col = byte - line_start_byte;
+
+        (byte, Point::new(line, col))
+    }
+
+    fn traverse(point: Point, text: &Tendril) -> Point {
+        let Point {
+            mut row,
+            mut column,
+        } = point;
+
+        // TODO: there should be a better way here.
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if char_is_line_ending(ch) && !(ch == '\r' && chars.peek() == Some(&'\n')) {
+                row += 1;
+                column = 0;
+            } else {
+                column += 1;
+            }
+        }
+        Point { row, column }
+    }
+
+    while let Some(change) = iter.next() {
+        let len = match change {
+            Delete(i) | Retain(i) => *i,
+            Insert(_) => 0,
+        };
+        let mut old_end = old_pos + len;
+
+        match change {
+            Retain(_) => {}
+            Delete(_) => {
+                let (start_byte, start_position) = point_at_pos(old_text, old_pos);
+                let (old_end_byte, old_end_position) = point_at_pos(old_text, old_end);
+
+                // deletion
+                edits.push(tree_sitter::InputEdit {
+                    start_byte,                       // old_pos to byte
+                    old_end_byte,                     // old_end to byte
+                    new_end_byte: start_byte,         // old_pos to byte
+                    start_position,                   // old pos to coords
+                    old_end_position,                 // old_end to coords
+                    new_end_position: start_position, // old pos to coords
+                });
+            }
+            Insert(s) => {
+                let (start_byte, start_position) = point_at_pos(old_text, old_pos);
+
+                // a subsequent delete means a replace, consume it
+                if let Some(Delete(len)) = iter.peek() {
+                    old_end = old_pos + len;
+                    let (old_end_byte, old_end_position) = point_at_pos(old_text, old_end);
+
+                    iter.next();
+
+                    // replacement
+                    edits.push(tree_sitter::InputEdit {
+                        start_byte,                                    // old_pos to byte
+                        old_end_byte,                                  // old_end to byte
+                        new_end_byte: start_byte + s.len(),            // old_pos to byte + s.len()
+                        start_position,                                // old pos to coords
+                        old_end_position,                              // old_end to coords
+                        new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
+                    });
+                } else {
+                    // insert
+                    edits.push(tree_sitter::InputEdit {
+                        start_byte,                                    // old_pos to byte
+                        old_end_byte: start_byte,                      // same
+                        new_end_byte: start_byte + s.len(),            // old_pos + s.len()
+                        start_position,                                // old pos to coords
+                        old_end_position: start_position,              // same
+                        new_end_position: traverse(start_position, s), // old pos + chars, newlines matter too (iter over)
+                    });
+                }
+            }
+        }
+        old_pos = old_end;
+    }
+    edits
+}
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{iter, mem, ops, str, usize};
 use tree_sitter::{
     Language as Grammar, Node, Parser, Point, Query, QueryCaptures, QueryCursor, QueryError,
-    QueryMatch, Range, TextProvider, Tree,
+    QueryMatch, Range, TextProvider, Tree, TreeCursor,
 };
 
 const CANCELLATION_CHECK_INTERVAL: usize = 100;
@@ -794,6 +1298,7 @@ pub struct Highlight(pub usize);
 pub enum Error {
     Cancelled,
     InvalidLanguage,
+    InvalidRanges,
     Unknown,
 }
 
@@ -805,15 +1310,15 @@ pub enum HighlightEvent {
     HighlightEnd,
 }
 
-/// Contains the data neeeded to higlight code written in a particular language.
+/// Contains the data needed to highlight code written in a particular language.
 ///
 /// This struct is immutable and can be shared between threads.
 #[derive(Debug)]
 pub struct HighlightConfiguration {
     pub language: Grammar,
     pub query: Query,
+    injections_query: Query,
     combined_injections_query: Option<Query>,
-    locals_pattern_index: usize,
     highlights_pattern_index: usize,
     highlight_indices: ArcSwap<Vec<Option<Highlight>>>,
     non_local_variable_patterns: Vec<bool>,
@@ -840,22 +1345,18 @@ struct LocalScope<'a> {
 }
 
 #[derive(Debug)]
-struct HighlightIter<'a, F>
-where
-    F: FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
-{
+struct HighlightIter<'a> {
     source: RopeSlice<'a>,
     byte_offset: usize,
-    injection_callback: F,
     cancellation_flag: Option<&'a AtomicUsize>,
     layers: Vec<HighlightIterLayer<'a>>,
     iter_count: usize,
     next_event: Option<HighlightEvent>,
-    last_highlight_range: Option<(usize, usize, usize)>,
+    last_highlight_range: Option<(usize, usize, u32)>,
 }
 
 // Adapter to convert rope chunks to bytes
-struct ChunksBytes<'a> {
+pub struct ChunksBytes<'a> {
     chunks: ropey::iter::Chunks<'a>,
 }
 impl<'a> Iterator for ChunksBytes<'a> {
@@ -865,14 +1366,12 @@ impl<'a> Iterator for ChunksBytes<'a> {
     }
 }
 
-struct RopeProvider<'a>(RopeSlice<'a>);
+pub struct RopeProvider<'a>(pub RopeSlice<'a>);
 impl<'a> TextProvider<'a> for RopeProvider<'a> {
     type I = ChunksBytes<'a>;
 
     fn text(&mut self, node: Node) -> Self::I {
-        let start_char = self.0.byte_to_char(node.start_byte());
-        let end_char = self.0.byte_to_char(node.end_byte());
-        let fragment = self.0.slice(start_char..end_char);
+        let fragment = self.0.byte_slice(node.start_byte()..node.end_byte());
         ChunksBytes {
             chunks: fragment.chunks(),
         }
@@ -886,8 +1385,8 @@ struct HighlightIterLayer<'a> {
     config: &'a HighlightConfiguration,
     highlight_end_stack: Vec<usize>,
     scope_stack: Vec<LocalScope<'a>>,
-    ranges: Vec<Range>,
-    depth: usize,
+    depth: u32,
+    ranges: &'a [Range],
 }
 
 impl<'a> fmt::Debug for HighlightIterLayer<'a> {
@@ -919,38 +1418,32 @@ impl HighlightConfiguration {
     ) -> Result<Self, QueryError> {
         // Concatenate the query strings, keeping track of the start offset of each section.
         let mut query_source = String::new();
-        query_source.push_str(injection_query);
-        let locals_query_offset = query_source.len();
         query_source.push_str(locals_query);
         let highlights_query_offset = query_source.len();
         query_source.push_str(highlights_query);
 
         // Construct a single query by concatenating the three query strings, but record the
         // range of pattern indices that belong to each individual string.
-        let mut query = Query::new(language, &query_source)?;
-        let mut locals_pattern_index = 0;
+        let query = Query::new(language, &query_source)?;
         let mut highlights_pattern_index = 0;
         for i in 0..(query.pattern_count()) {
             let pattern_offset = query.start_byte_for_pattern(i);
             if pattern_offset < highlights_query_offset {
-                if pattern_offset < highlights_query_offset {
-                    highlights_pattern_index += 1;
-                }
-                if pattern_offset < locals_query_offset {
-                    locals_pattern_index += 1;
-                }
+                highlights_pattern_index += 1;
             }
         }
+
+        let mut injections_query = Query::new(language, injection_query)?;
 
         // Construct a separate query just for dealing with the 'combined injections'.
         // Disable the combined injection patterns in the main query.
         let mut combined_injections_query = Query::new(language, injection_query)?;
         let mut has_combined_queries = false;
-        for pattern_index in 0..locals_pattern_index {
-            let settings = query.property_settings(pattern_index);
+        for pattern_index in 0..injections_query.pattern_count() {
+            let settings = injections_query.property_settings(pattern_index);
             if settings.iter().any(|s| &*s.key == "injection.combined") {
                 has_combined_queries = true;
-                query.disable_pattern(pattern_index);
+                injections_query.disable_pattern(pattern_index);
             } else {
                 combined_injections_query.disable_pattern(pattern_index);
             }
@@ -982,8 +1475,6 @@ impl HighlightConfiguration {
         for (i, name) in query.capture_names().iter().enumerate() {
             let i = Some(i as u32);
             match name.as_str() {
-                "injection.content" => injection_content_capture_index = i,
-                "injection.language" => injection_language_capture_index = i,
                 "local.definition" => local_def_capture_index = i,
                 "local.definition-value" => local_def_value_capture_index = i,
                 "local.reference" => local_ref_capture_index = i,
@@ -992,12 +1483,21 @@ impl HighlightConfiguration {
             }
         }
 
+        for (i, name) in injections_query.capture_names().iter().enumerate() {
+            let i = Some(i as u32);
+            match name.as_str() {
+                "injection.content" => injection_content_capture_index = i,
+                "injection.language" => injection_language_capture_index = i,
+                _ => {}
+            }
+        }
+
         let highlight_indices = ArcSwap::from_pointee(vec![None; query.capture_names().len()]);
         Ok(Self {
             language,
             query,
+            injections_query,
             combined_injections_query,
-            locals_pattern_index,
             highlights_pattern_index,
             highlight_indices,
             non_local_variable_patterns,
@@ -1020,8 +1520,8 @@ impl HighlightConfiguration {
     /// Tree-sitter syntax-highlighting queries specify highlights in the form of dot-separated
     /// highlight names like `punctuation.bracket` and `function.method.builtin`. Consumers of
     /// these queries can choose to recognize highlights with different levels of specificity.
-    /// For example, the string `function.builtin` will match against `function.method.builtin`
-    /// and `function.builtin.constructor`, but will not match `function.method`.
+    /// For example, the string `function.builtin` will match against `function.builtin.constructor`
+    /// but will not match `function.method.builtin` and `function.method`.
     ///
     /// When highlighting, results are returned as `Highlight` values, which contain the index
     /// of the matched highlight this list of highlight names.
@@ -1041,11 +1541,13 @@ impl HighlightConfiguration {
                     let recognized_name = recognized_name;
                     let mut len = 0;
                     let mut matches = true;
-                    for part in recognized_name.split('.') {
-                        len += 1;
-                        if !capture_parts.contains(&part) {
-                            matches = false;
-                            break;
+                    for (i, part) in recognized_name.split('.').enumerate() {
+                        match capture_parts.get(i) {
+                            Some(capture_part) if *capture_part == part => len += 1,
+                            _ => {
+                                matches = false;
+                                break;
+                            }
                         }
                     }
                     if matches && len > best_match_len {
@@ -1062,238 +1564,6 @@ impl HighlightConfiguration {
 }
 
 impl<'a> HighlightIterLayer<'a> {
-    /// Create a new 'layer' of highlighting for this document.
-    ///
-    /// In the even that the new layer contains "combined injections" (injections where multiple
-    /// disjoint ranges are parsed as one syntax tree), these will be eagerly processed and
-    /// added to the returned vector.
-    fn new<F: FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a>(
-        source: RopeSlice<'a>,
-        cancellation_flag: Option<&'a AtomicUsize>,
-        injection_callback: &mut F,
-        mut config: &'a HighlightConfiguration,
-        mut depth: usize,
-        mut ranges: Vec<Range>,
-    ) -> Result<Vec<Self>, Error> {
-        let mut result = Vec::with_capacity(1);
-        let mut queue = Vec::new();
-        loop {
-            // --> Tree parsing part
-
-            PARSER.with(|ts_parser| {
-                let highlighter = &mut ts_parser.borrow_mut();
-
-                if highlighter.parser.set_included_ranges(&ranges).is_ok() {
-                    highlighter
-                        .parser
-                        .set_language(config.language)
-                        .map_err(|_| Error::InvalidLanguage)?;
-
-                    unsafe { highlighter.parser.set_cancellation_flag(cancellation_flag) };
-                    let tree = highlighter
-                        .parser
-                        .parse_with(
-                            &mut |byte, _| {
-                                if byte <= source.len_bytes() {
-                                    let (chunk, start_byte, _, _) = source.chunk_at_byte(byte);
-                                    chunk[byte - start_byte..].as_bytes()
-                                } else {
-                                    // out of range
-                                    &[]
-                                }
-                            },
-                            None,
-                        )
-                        .ok_or(Error::Cancelled)?;
-                    unsafe { highlighter.parser.set_cancellation_flag(None) };
-                    let mut cursor = highlighter.cursors.pop().unwrap_or_else(QueryCursor::new);
-
-                    // Process combined injections.
-                    if let Some(combined_injections_query) = &config.combined_injections_query {
-                        let mut injections_by_pattern_index = vec![
-                            (None, Vec::new(), false);
-                            combined_injections_query
-                                .pattern_count()
-                        ];
-                        let matches = cursor.matches(
-                            combined_injections_query,
-                            tree.root_node(),
-                            RopeProvider(source),
-                        );
-                        for mat in matches {
-                            let entry = &mut injections_by_pattern_index[mat.pattern_index];
-                            let (language_name, content_node, include_children) =
-                                injection_for_match(
-                                    config,
-                                    combined_injections_query,
-                                    &mat,
-                                    source,
-                                );
-                            if language_name.is_some() {
-                                entry.0 = language_name;
-                            }
-                            if let Some(content_node) = content_node {
-                                entry.1.push(content_node);
-                            }
-                            entry.2 = include_children;
-                        }
-                        for (lang_name, content_nodes, includes_children) in
-                            injections_by_pattern_index
-                        {
-                            if let (Some(lang_name), false) = (lang_name, content_nodes.is_empty())
-                            {
-                                if let Some(next_config) = (injection_callback)(&lang_name) {
-                                    let ranges = Self::intersect_ranges(
-                                        &ranges,
-                                        &content_nodes,
-                                        includes_children,
-                                    );
-                                    if !ranges.is_empty() {
-                                        queue.push((next_config, depth + 1, ranges));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // --> Highlighting query part
-
-                    // The `captures` iterator borrows the `Tree` and the `QueryCursor`, which
-                    // prevents them from being moved. But both of these values are really just
-                    // pointers, so it's actually ok to move them.
-                    let tree_ref = unsafe { mem::transmute::<_, &'static Tree>(&tree) };
-                    let cursor_ref =
-                        unsafe { mem::transmute::<_, &'static mut QueryCursor>(&mut cursor) };
-                    let captures = cursor_ref
-                        .captures(&config.query, tree_ref.root_node(), RopeProvider(source))
-                        .peekable();
-
-                    result.push(HighlightIterLayer {
-                        highlight_end_stack: Vec::new(),
-                        scope_stack: vec![LocalScope {
-                            inherits: false,
-                            range: 0..usize::MAX,
-                            local_defs: Vec::new(),
-                        }],
-                        cursor,
-                        depth,
-                        _tree: Some(tree),
-                        captures,
-                        config,
-                        ranges,
-                    });
-                }
-
-                Ok(()) // so we can use the try operator
-            })?;
-
-            if queue.is_empty() {
-                break;
-            }
-
-            let (next_config, next_depth, next_ranges) = queue.remove(0);
-            config = next_config;
-            depth = next_depth;
-            ranges = next_ranges;
-        }
-
-        Ok(result)
-    }
-
-    // Compute the ranges that should be included when parsing an injection.
-    // This takes into account three things:
-    // * `parent_ranges` - The ranges must all fall within the *current* layer's ranges.
-    // * `nodes` - Every injection takes place within a set of nodes. The injection ranges
-    //   are the ranges of those nodes.
-    // * `includes_children` - For some injections, the content nodes' children should be
-    //   excluded from the nested document, so that only the content nodes' *own* content
-    //   is reparsed. For other injections, the content nodes' entire ranges should be
-    //   reparsed, including the ranges of their children.
-    fn intersect_ranges(
-        parent_ranges: &[Range],
-        nodes: &[Node],
-        includes_children: bool,
-    ) -> Vec<Range> {
-        let mut cursor = nodes[0].walk();
-        let mut result = Vec::new();
-        let mut parent_range_iter = parent_ranges.iter();
-        let mut parent_range = parent_range_iter
-            .next()
-            .expect("Layers should only be constructed with non-empty ranges vectors");
-        for node in nodes.iter() {
-            let mut preceding_range = Range {
-                start_byte: 0,
-                start_point: Point::new(0, 0),
-                end_byte: node.start_byte(),
-                end_point: node.start_position(),
-            };
-            let following_range = Range {
-                start_byte: node.end_byte(),
-                start_point: node.end_position(),
-                end_byte: usize::MAX,
-                end_point: Point::new(usize::MAX, usize::MAX),
-            };
-
-            for excluded_range in node
-                .children(&mut cursor)
-                .filter_map(|child| {
-                    if includes_children {
-                        None
-                    } else {
-                        Some(child.range())
-                    }
-                })
-                .chain([following_range].iter().cloned())
-            {
-                let mut range = Range {
-                    start_byte: preceding_range.end_byte,
-                    start_point: preceding_range.end_point,
-                    end_byte: excluded_range.start_byte,
-                    end_point: excluded_range.start_point,
-                };
-                preceding_range = excluded_range;
-
-                if range.end_byte < parent_range.start_byte {
-                    continue;
-                }
-
-                while parent_range.start_byte <= range.end_byte {
-                    if parent_range.end_byte > range.start_byte {
-                        if range.start_byte < parent_range.start_byte {
-                            range.start_byte = parent_range.start_byte;
-                            range.start_point = parent_range.start_point;
-                        }
-
-                        if parent_range.end_byte < range.end_byte {
-                            if range.start_byte < parent_range.end_byte {
-                                result.push(Range {
-                                    start_byte: range.start_byte,
-                                    start_point: range.start_point,
-                                    end_byte: parent_range.end_byte,
-                                    end_point: parent_range.end_point,
-                                });
-                            }
-                            range.start_byte = parent_range.end_byte;
-                            range.start_point = parent_range.end_point;
-                        } else {
-                            if range.start_byte < range.end_byte {
-                                result.push(range);
-                            }
-                            break;
-                        }
-                    }
-
-                    if let Some(next_range) = parent_range_iter.next() {
-                        parent_range = next_range;
-                    } else {
-                        return result;
-                    }
-                }
-            }
-        }
-        result
-    }
-
     // First, sort scope boundaries by their byte offset in the document. At a
     // given position, emit scope endings before scope beginnings. Finally, emit
     // scope boundaries from deeper layers first.
@@ -1319,10 +1589,118 @@ impl<'a> HighlightIterLayer<'a> {
     }
 }
 
-impl<'a, F> HighlightIter<'a, F>
-where
-    F: FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
-{
+#[derive(Clone)]
+enum IncludedChildren {
+    None,
+    All,
+    Unnamed,
+}
+
+impl Default for IncludedChildren {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+// Compute the ranges that should be included when parsing an injection.
+// This takes into account three things:
+// * `parent_ranges` - The ranges must all fall within the *current* layer's ranges.
+// * `nodes` - Every injection takes place within a set of nodes. The injection ranges
+//   are the ranges of those nodes.
+// * `includes_children` - For some injections, the content nodes' children should be
+//   excluded from the nested document, so that only the content nodes' *own* content
+//   is reparsed. For other injections, the content nodes' entire ranges should be
+//   reparsed, including the ranges of their children.
+fn intersect_ranges(
+    parent_ranges: &[Range],
+    nodes: &[Node],
+    included_children: IncludedChildren,
+) -> Vec<Range> {
+    let mut cursor = nodes[0].walk();
+    let mut result = Vec::new();
+    let mut parent_range_iter = parent_ranges.iter();
+    let mut parent_range = parent_range_iter
+        .next()
+        .expect("Layers should only be constructed with non-empty ranges vectors");
+    for node in nodes.iter() {
+        let mut preceding_range = Range {
+            start_byte: 0,
+            start_point: Point::new(0, 0),
+            end_byte: node.start_byte(),
+            end_point: node.start_position(),
+        };
+        let following_range = Range {
+            start_byte: node.end_byte(),
+            start_point: node.end_position(),
+            end_byte: usize::MAX,
+            end_point: Point::new(usize::MAX, usize::MAX),
+        };
+
+        for excluded_range in node
+            .children(&mut cursor)
+            .filter_map(|child| match included_children {
+                IncludedChildren::None => Some(child.range()),
+                IncludedChildren::All => None,
+                IncludedChildren::Unnamed => {
+                    if child.is_named() {
+                        Some(child.range())
+                    } else {
+                        None
+                    }
+                }
+            })
+            .chain([following_range].iter().cloned())
+        {
+            let mut range = Range {
+                start_byte: preceding_range.end_byte,
+                start_point: preceding_range.end_point,
+                end_byte: excluded_range.start_byte,
+                end_point: excluded_range.start_point,
+            };
+            preceding_range = excluded_range;
+
+            if range.end_byte < parent_range.start_byte {
+                continue;
+            }
+
+            while parent_range.start_byte <= range.end_byte {
+                if parent_range.end_byte > range.start_byte {
+                    if range.start_byte < parent_range.start_byte {
+                        range.start_byte = parent_range.start_byte;
+                        range.start_point = parent_range.start_point;
+                    }
+
+                    if parent_range.end_byte < range.end_byte {
+                        if range.start_byte < parent_range.end_byte {
+                            result.push(Range {
+                                start_byte: range.start_byte,
+                                start_point: range.start_point,
+                                end_byte: parent_range.end_byte,
+                                end_point: parent_range.end_point,
+                            });
+                        }
+                        range.start_byte = parent_range.end_byte;
+                        range.start_point = parent_range.end_point;
+                    } else {
+                        if range.start_byte < range.end_byte {
+                            result.push(range);
+                        }
+                        break;
+                    }
+                }
+
+                if let Some(next_range) = parent_range_iter.next() {
+                    parent_range = next_range;
+                } else {
+                    return result;
+                }
+            }
+        }
+    }
+    result
+}
+
+impl<'a> HighlightIter<'a> {
     fn emit_event(
         &mut self,
         offset: usize,
@@ -1353,6 +1731,12 @@ where
                             i += 1;
                             continue;
                         }
+                    } else {
+                        let layer = self.layers.remove(i + 1);
+                        PARSER.with(|ts_parser| {
+                            let highlighter = &mut ts_parser.borrow_mut();
+                            highlighter.cursors.push(layer.cursor);
+                        });
                     }
                     break;
                 }
@@ -1369,30 +1753,9 @@ where
             }
         }
     }
-
-    fn insert_layer(&mut self, mut layer: HighlightIterLayer<'a>) {
-        if let Some(sort_key) = layer.sort_key() {
-            let mut i = 1;
-            while i < self.layers.len() {
-                if let Some(sort_key_i) = self.layers[i].sort_key() {
-                    if sort_key_i > sort_key {
-                        self.layers.insert(i, layer);
-                        return;
-                    }
-                    i += 1;
-                } else {
-                    self.layers.remove(i);
-                }
-            }
-            self.layers.push(layer);
-        }
-    }
 }
 
-impl<'a, F> Iterator for HighlightIter<'a, F>
-where
-    F: FnMut(&str) -> Option<&'a HighlightConfiguration> + 'a,
-{
+impl<'a> Iterator for HighlightIter<'a> {
     type Item = Result<HighlightEvent, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1452,54 +1815,11 @@ where
                 layer.highlight_end_stack.pop();
                 return self.emit_event(end_byte, Some(HighlightEvent::HighlightEnd));
             } else {
-                // return self.emit_event(self.source.len(), None);
-                return None;
+                return self.emit_event(self.source.len_bytes(), None);
             };
 
             let (mut match_, capture_index) = layer.captures.next().unwrap();
             let mut capture = match_.captures[capture_index];
-
-            // If this capture represents an injection, then process the injection.
-            if match_.pattern_index < layer.config.locals_pattern_index {
-                let (language_name, content_node, include_children) =
-                    injection_for_match(layer.config, &layer.config.query, &match_, self.source);
-
-                // Explicitly remove this match so that none of its other captures will remain
-                // in the stream of captures.
-                match_.remove();
-
-                // If a language is found with the given name, then add a new language layer
-                // to the highlighted document.
-                if let (Some(language_name), Some(content_node)) = (language_name, content_node) {
-                    if let Some(config) = (self.injection_callback)(&language_name) {
-                        let ranges = HighlightIterLayer::intersect_ranges(
-                            &self.layers[0].ranges,
-                            &[content_node],
-                            include_children,
-                        );
-                        if !ranges.is_empty() {
-                            match HighlightIterLayer::new(
-                                self.source,
-                                self.cancellation_flag,
-                                &mut self.injection_callback,
-                                config,
-                                self.layers[0].depth + 1,
-                                ranges,
-                            ) {
-                                Ok(layers) => {
-                                    for layer in layers {
-                                        self.insert_layer(layer);
-                                    }
-                                }
-                                Err(e) => return Some(Err(e)),
-                            }
-                        }
-                    }
-                }
-
-                self.sort_layers();
-                continue 'main;
-            }
 
             // Remove from the local scope stack any local scopes that have already ended.
             while range.start > layer.scope_stack.last().unwrap().range.end {
@@ -1655,7 +1975,7 @@ fn injection_for_match<'a>(
     query: &'a Query,
     query_match: &QueryMatch<'a, 'a>,
     source: RopeSlice<'a>,
-) -> (Option<Cow<'a, str>>, Option<Node<'a>>, bool) {
+) -> (Option<Cow<'a, str>>, Option<Node<'a>>, IncludedChildren) {
     let content_capture_index = config.injection_content_capture_index;
     let language_capture_index = config.injection_language_capture_index;
 
@@ -1671,7 +1991,7 @@ fn injection_for_match<'a>(
         }
     }
 
-    let mut include_children = false;
+    let mut included_children = IncludedChildren::default();
     for prop in query.property_settings(query_match.pattern_index) {
         match prop.key.as_ref() {
             // In addition to specifying the language name via the text of a
@@ -1687,21 +2007,18 @@ fn injection_for_match<'a>(
             // `injection.content` node - only the ranges that belong to the
             // node itself. This can be changed using a `#set!` predicate that
             // sets the `injection.include-children` key.
-            "injection.include-children" => include_children = true,
+            "injection.include-children" => included_children = IncludedChildren::All,
+
+            // Some queries might only exclude named children but include unnamed
+            // children in their `injection.content` node. This can be enabled using
+            // a `#set!` predicate that sets the `injection.include-unnamed-children` key.
+            "injection.include-unnamed-children" => included_children = IncludedChildren::Unnamed,
             _ => {}
         }
     }
 
-    (language_name, content_node, include_children)
+    (language_name, content_node, included_children)
 }
-
-// fn shrink_and_clear<T>(vec: &mut Vec<T>, capacity: usize) {
-//     if vec.len() > capacity {
-//         vec.truncate(capacity);
-//         vec.shrink_to_fit();
-//     }
-//     vec.clear();
-// }
 
 pub struct Merge<I> {
     iter: I,
@@ -1837,10 +2154,118 @@ impl<I: Iterator<Item = HighlightEvent>> Iterator for Merge<I> {
     }
 }
 
+fn node_is_visible(node: &Node) -> bool {
+    node.is_missing() || (node.is_named() && node.language().node_kind_is_visible(node.kind_id()))
+}
+
+pub fn pretty_print_tree<W: fmt::Write>(fmt: &mut W, node: Node) -> fmt::Result {
+    if node.child_count() == 0 {
+        if node_is_visible(&node) {
+            write!(fmt, "({})", node.kind())
+        } else {
+            write!(fmt, "\"{}\"", node.kind())
+        }
+    } else {
+        pretty_print_tree_impl(fmt, &mut node.walk(), 0)
+    }
+}
+
+fn pretty_print_tree_impl<W: fmt::Write>(
+    fmt: &mut W,
+    cursor: &mut TreeCursor,
+    depth: usize,
+) -> fmt::Result {
+    let node = cursor.node();
+    let visible = node_is_visible(&node);
+
+    if visible {
+        let indentation_columns = depth * 2;
+        write!(fmt, "{:indentation_columns$}", "")?;
+
+        if let Some(field_name) = cursor.field_name() {
+            write!(fmt, "{}: ", field_name)?;
+        }
+
+        write!(fmt, "({}", node.kind())?;
+    }
+
+    // Handle children.
+    if cursor.goto_first_child() {
+        loop {
+            if node_is_visible(&cursor.node()) {
+                fmt.write_char('\n')?;
+            }
+
+            pretty_print_tree_impl(fmt, cursor, depth + 1)?;
+
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+
+        let moved = cursor.goto_parent();
+        // The parent of the first child must exist, and must be `node`.
+        debug_assert!(moved);
+        debug_assert!(cursor.node() == node);
+    }
+
+    if visible {
+        fmt.write_char(')')?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::{Rope, Transaction};
+
+    #[test]
+    fn test_textobject_queries() {
+        let query_str = r#"
+        (line_comment)+ @quantified_nodes
+        ((line_comment)+) @quantified_nodes_grouped
+        ((line_comment) (line_comment)) @multiple_nodes_grouped
+        "#;
+        let source = Rope::from_str(
+            r#"
+/// a comment on
+/// multiple lines
+        "#,
+        );
+
+        let loader = Loader::new(Configuration { language: vec![] });
+        let language = get_language("rust").unwrap();
+
+        let query = Query::new(language, query_str).unwrap();
+        let textobject = TextObjectQuery { query };
+        let mut cursor = QueryCursor::new();
+
+        let config = HighlightConfiguration::new(language, "", "", "").unwrap();
+        let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
+
+        let root = syntax.tree().root_node();
+        let mut test = |capture, range| {
+            let matches: Vec<_> = textobject
+                .capture_nodes(capture, root, source.slice(..), &mut cursor)
+                .unwrap()
+                .collect();
+
+            assert_eq!(
+                matches[0].byte_range(),
+                range,
+                "@{} expected {:?}",
+                capture,
+                range
+            )
+        };
+
+        test("quantified_nodes", 1..36);
+        // NOTE: Enable after implementing proper node group capturing
+        // test("quantified_nodes_grouped", 1..36);
+        // test("multiple_nodes_grouped", 1..36);
+    }
 
     #[test]
     fn test_parser() {
@@ -1869,17 +2294,15 @@ mod test {
         .map(String::from)
         .collect();
 
-        let language = get_language(&crate::RUNTIME_DIR, "Rust").unwrap();
+        let loader = Loader::new(Configuration { language: vec![] });
+
+        let language = get_language("rust").unwrap();
         let config = HighlightConfiguration::new(
             language,
-            &std::fs::read_to_string(
-                "../helix-syntax/languages/tree-sitter-rust/queries/highlights.scm",
-            )
-            .unwrap(),
-            &std::fs::read_to_string(
-                "../helix-syntax/languages/tree-sitter-rust/queries/injections.scm",
-            )
-            .unwrap(),
+            &std::fs::read_to_string("../runtime/grammars/sources/rust/queries/highlights.scm")
+                .unwrap(),
+            &std::fs::read_to_string("../runtime/grammars/sources/rust/queries/injections.scm")
+                .unwrap(),
             "", // locals.scm
         )
         .unwrap();
@@ -1891,7 +2314,7 @@ mod test {
             fn main() {}
         ",
         );
-        let syntax = Syntax::new(&source, Arc::new(config));
+        let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
         let tree = syntax.tree();
         let root = tree.root_node();
         assert_eq!(root.kind(), "source_file");
@@ -1918,7 +2341,7 @@ mod test {
             &doc,
             vec![(6, 11, Some("test".into())), (12, 17, None)].into_iter(),
         );
-        let edits = LanguageLayer::generate_edits(doc.slice(..), transaction.changes());
+        let edits = generate_edits(&doc, transaction.changes());
         // transaction.apply(&mut state);
 
         assert_eq!(
@@ -1947,7 +2370,7 @@ mod test {
         let mut doc = Rope::from("fn test() {}");
         let transaction =
             Transaction::change(&doc, vec![(8, 8, Some("a: u32".into()))].into_iter());
-        let edits = LanguageLayer::generate_edits(doc.slice(..), transaction.changes());
+        let edits = generate_edits(&doc, transaction.changes());
         transaction.apply(&mut doc);
 
         assert_eq!(doc, "fn test(a: u32) {}");
@@ -1964,10 +2387,97 @@ mod test {
         );
     }
 
+    #[track_caller]
+    fn assert_pretty_print(
+        language_name: &str,
+        source: &str,
+        expected: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let source = Rope::from_str(source);
+
+        let loader = Loader::new(Configuration { language: vec![] });
+        let language = get_language(language_name).unwrap();
+
+        let config = HighlightConfiguration::new(language, "", "", "").unwrap();
+        let syntax = Syntax::new(&source, Arc::new(config), Arc::new(loader));
+
+        let root = syntax
+            .tree()
+            .root_node()
+            .descendant_for_byte_range(start, end)
+            .unwrap();
+
+        let mut output = String::new();
+        pretty_print_tree(&mut output, root).unwrap();
+
+        assert_eq!(expected, output);
+    }
+
+    #[test]
+    fn test_pretty_print() {
+        let source = r#"/// Hello"#;
+        assert_pretty_print("rust", source, "(line_comment)", 0, source.len());
+
+        // A large tree should be indented with fields:
+        let source = r#"fn main() {
+            println!("Hello, World!");
+        }"#;
+        assert_pretty_print(
+            "rust",
+            source,
+            concat!(
+                "(function_item\n",
+                "  name: (identifier)\n",
+                "  parameters: (parameters)\n",
+                "  body: (block\n",
+                "    (expression_statement\n",
+                "      (macro_invocation\n",
+                "        macro: (identifier)\n",
+                "        (token_tree\n",
+                "          (string_literal))))))",
+            ),
+            0,
+            source.len(),
+        );
+
+        // Selecting a token should print just that token:
+        let source = r#"fn main() {}"#;
+        assert_pretty_print("rust", source, r#""fn""#, 0, 1);
+
+        // Error nodes are printed as errors:
+        let source = r#"}{"#;
+        assert_pretty_print("rust", source, "(ERROR)", 0, source.len());
+
+        // Fields broken under unnamed nodes are determined correctly.
+        // In the following source, `object` belongs to the `singleton_method`
+        // rule but `name` and `body` belong to an unnamed helper `_method_rest`.
+        // This can cause a bug with a pretty-printing implementation that
+        // uses `Node::field_name_for_child` to determine field names but is
+        // fixed when using `TreeCursor::field_name`.
+        let source = "def self.method_name
+          true
+        end";
+        assert_pretty_print(
+            "ruby",
+            source,
+            concat!(
+                "(singleton_method\n",
+                "  object: (self)\n",
+                "  name: (identifier)\n",
+                "  body: (body_statement\n",
+                "    (true)))"
+            ),
+            0,
+            source.len(),
+        );
+    }
+
     #[test]
     fn test_load_runtime_file() {
         // Test to make sure we can load some data from the runtime directory.
-        let contents = load_runtime_file("rust", "indents.toml").unwrap();
+        let contents = load_runtime_file("rust", "indents.scm").unwrap();
         assert!(!contents.is_empty());
 
         let results = load_runtime_file("rust", "does-not-exist");

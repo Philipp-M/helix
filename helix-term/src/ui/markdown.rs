@@ -6,16 +6,114 @@ use tui::{
 
 use std::sync::Arc;
 
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
 use helix_core::{
     syntax::{self, HighlightEvent, Syntax},
     Rope,
 };
 use helix_view::{
-    graphics::{Margin, Rect},
+    graphics::{Margin, Rect, Style},
     Theme,
 };
+
+fn styled_multiline_text<'a>(text: String, style: Style) -> Text<'a> {
+    let spans: Vec<_> = text
+        .lines()
+        .map(|line| Span::styled(line.to_string(), style))
+        .map(Spans::from)
+        .collect();
+    Text::from(spans)
+}
+
+pub fn highlighted_code_block<'a>(
+    text: String,
+    language: &str,
+    theme: Option<&Theme>,
+    config_loader: Arc<syntax::Loader>,
+    additional_highlight_spans: Option<Vec<(usize, std::ops::Range<usize>)>>,
+) -> Text<'a> {
+    let mut spans = Vec::new();
+    let mut lines = Vec::new();
+
+    let get_theme = |key: &str| -> Style { theme.map(|t| t.get(key)).unwrap_or_default() };
+    let text_style = get_theme(Markdown::TEXT_STYLE);
+    let code_style = get_theme(Markdown::BLOCK_STYLE);
+
+    let theme = match theme {
+        Some(t) => t,
+        None => return styled_multiline_text(text, code_style),
+    };
+
+    let rope = Rope::from(text.as_ref());
+    let syntax = config_loader
+        .language_configuration_for_injection_string(language)
+        .and_then(|config| config.highlight_config(theme.scopes()))
+        .map(|config| Syntax::new(&rope, config, Arc::clone(&config_loader)));
+
+    let syntax = match syntax {
+        Some(s) => s,
+        None => return styled_multiline_text(text, code_style),
+    };
+
+    let highlight_iter = syntax
+        .highlight_iter(rope.slice(..), None, None)
+        .map(|e| e.unwrap());
+    let highlight_iter: Box<dyn Iterator<Item = HighlightEvent>> =
+        if let Some(spans) = additional_highlight_spans {
+            Box::new(helix_core::syntax::merge(highlight_iter, spans))
+        } else {
+            Box::new(highlight_iter)
+        };
+
+    let mut highlights = Vec::new();
+    for event in highlight_iter {
+        match event {
+            HighlightEvent::HighlightStart(span) => {
+                highlights.push(span);
+            }
+            HighlightEvent::HighlightEnd => {
+                highlights.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                let style = highlights
+                    .iter()
+                    .fold(text_style, |acc, span| acc.patch(theme.highlight(span.0)));
+
+                let mut slice = &text[start..end];
+                // TODO: do we need to handle all unicode line endings
+                // here, or is just '\n' okay?
+                while let Some(end) = slice.find('\n') {
+                    // emit span up to newline
+                    let text = &slice[..end];
+                    let text = text.replace('\t', "    "); // replace tabs
+                    let span = Span::styled(text, style);
+                    spans.push(span);
+
+                    // truncate slice to after newline
+                    slice = &slice[end + 1..];
+
+                    // make a new line
+                    let spans = std::mem::take(&mut spans);
+                    lines.push(Spans::from(spans));
+                }
+
+                // if there's anything left, emit it too
+                if !slice.is_empty() {
+                    let span = Span::styled(slice.replace('\t', "    "), style);
+                    spans.push(span);
+                }
+            }
+        }
+    }
+
+    if !spans.is_empty() {
+        let spans = std::mem::take(&mut spans);
+        lines.push(Spans::from(spans));
+    }
+
+    Text::from(lines)
+}
 
 pub struct Markdown {
     contents: String,
@@ -27,198 +125,218 @@ pub struct Markdown {
 // better yet, just use Tendril + subtendril for references
 
 impl Markdown {
+    const TEXT_STYLE: &'static str = "ui.text";
+    const BLOCK_STYLE: &'static str = "markup.raw.inline";
+    const HEADING_STYLES: [&'static str; 6] = [
+        "markup.heading.1",
+        "markup.heading.2",
+        "markup.heading.3",
+        "markup.heading.4",
+        "markup.heading.5",
+        "markup.heading.6",
+    ];
+    const INDENT: &'static str = "  ";
+
     pub fn new(contents: String, config_loader: Arc<syntax::Loader>) -> Self {
         Self {
             contents,
             config_loader,
         }
     }
-}
 
-fn parse<'a>(
-    contents: &'a str,
-    theme: Option<&Theme>,
-    loader: &syntax::Loader,
-) -> tui::text::Text<'a> {
-    // // also 2021-03-04T16:33:58.553 helix_lsp::transport [INFO] <- {"contents":{"kind":"markdown","value":"\n```rust\ncore::num\n```\n\n```rust\npub const fn saturating_sub(self, rhs:Self) ->Self\n```\n\n---\n\n```rust\n```"},"range":{"end":{"character":61,"line":101},"start":{"character":47,"line":101}}}
-    // let text = "\n```rust\ncore::iter::traits::iterator::Iterator\n```\n\n```rust\nfn collect<B: FromIterator<Self::Item>>(self) -> B\nwhere\n        Self: Sized,\n```\n\n---\n\nTransforms an iterator into a collection.\n\n`collect()` can take anything iterable, and turn it into a relevant\ncollection. This is one of the more powerful methods in the standard\nlibrary, used in a variety of contexts.\n\nThe most basic pattern in which `collect()` is used is to turn one\ncollection into another. You take a collection, call [`iter`](https://doc.rust-lang.org/nightly/core/iter/traits/iterator/trait.Iterator.html) on it,\ndo a bunch of transformations, and then `collect()` at the end.\n\n`collect()` can also create instances of types that are not typical\ncollections. For example, a [`String`](https://doc.rust-lang.org/nightly/core/iter/std/string/struct.String.html) can be built from [`char`](type@char)s,\nand an iterator of [`Result<T, E>`](https://doc.rust-lang.org/nightly/core/result/enum.Result.html) items can be collected\ninto `Result<Collection<T>, E>`. See the examples below for more.\n\nBecause `collect()` is so general, it can cause problems with type\ninference. As such, `collect()` is one of the few times you'll see\nthe syntax affectionately known as the 'turbofish': `::<>`. This\nhelps the inference algorithm understand specifically which collection\nyou're trying to collect into.\n\n# Examples\n\nBasic usage:\n\n```rust\nlet a = [1, 2, 3];\n\nlet doubled: Vec<i32> = a.iter()\n                         .map(|&x| x * 2)\n                         .collect();\n\nassert_eq!(vec![2, 4, 6], doubled);\n```\n\nNote that we needed the `: Vec<i32>` on the left-hand side. This is because\nwe could collect into, for example, a [`VecDeque<T>`](https://doc.rust-lang.org/nightly/core/iter/std/collections/struct.VecDeque.html) instead:\n\n```rust\nuse std::collections::VecDeque;\n\nlet a = [1, 2, 3];\n\nlet doubled: VecDeque<i32> = a.iter().map(|&x| x * 2).collect();\n\nassert_eq!(2, doubled[0]);\nassert_eq!(4, doubled[1]);\nassert_eq!(6, doubled[2]);\n```\n\nUsing the 'turbofish' instead of annotating `doubled`:\n\n```rust\nlet a = [1, 2, 3];\n\nlet doubled = a.iter().map(|x| x * 2).collect::<Vec<i32>>();\n\nassert_eq!(vec![2, 4, 6], doubled);\n```\n\nBecause `collect()` only cares about what you're collecting into, you can\nstill use a partial type hint, `_`, with the turbofish:\n\n```rust\nlet a = [1, 2, 3];\n\nlet doubled = a.iter().map(|x| x * 2).collect::<Vec<_>>();\n\nassert_eq!(vec![2, 4, 6], doubled);\n```\n\nUsing `collect()` to make a [`String`](https://doc.rust-lang.org/nightly/core/iter/std/string/struct.String.html):\n\n```rust\nlet chars = ['g', 'd', 'k', 'k', 'n'];\n\nlet hello: String = chars.iter()\n    .map(|&x| x as u8)\n    .map(|x| (x + 1) as char)\n    .collect();\n\nassert_eq!(\"hello\", hello);\n```\n\nIf you have a list of [`Result<T, E>`](https://doc.rust-lang.org/nightly/core/result/enum.Result.html)s, you can use `collect()` to\nsee if any of them failed:\n\n```rust\nlet results = [Ok(1), Err(\"nope\"), Ok(3), Err(\"bad\")];\n\nlet result: Result<Vec<_>, &str> = results.iter().cloned().collect();\n\n// gives us the first error\nassert_eq!(Err(\"nope\"), result);\n\nlet results = [Ok(1), Ok(3)];\n\nlet result: Result<Vec<_>, &str> = results.iter().cloned().collect();\n\n// gives us the list of answers\nassert_eq!(Ok(vec![1, 3]), result);\n```";
+    pub fn parse(&self, theme: Option<&Theme>) -> tui::text::Text<'_> {
+        fn push_line<'a>(spans: &mut Vec<Span<'a>>, lines: &mut Vec<Spans<'a>>) {
+            let spans = std::mem::take(spans);
+            if !spans.is_empty() {
+                lines.push(Spans::from(spans));
+            }
+        }
 
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(contents, options);
+        let mut options = Options::empty();
+        options.insert(Options::ENABLE_STRIKETHROUGH);
+        let parser = Parser::new_ext(&self.contents, options);
 
-    // TODO: if possible, render links as terminal hyperlinks: https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
-    let mut tags = Vec::new();
-    let mut spans = Vec::new();
-    let mut lines = Vec::new();
+        // TODO: if possible, render links as terminal hyperlinks: https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
+        let mut tags = Vec::new();
+        let mut spans = Vec::new();
+        let mut lines = Vec::new();
+        let mut list_stack = Vec::new();
 
-    fn to_span(text: pulldown_cmark::CowStr) -> Span {
-        use std::ops::Deref;
-        Span::raw::<std::borrow::Cow<_>>(match text {
-            CowStr::Borrowed(s) => s.into(),
-            CowStr::Boxed(s) => s.to_string().into(),
-            CowStr::Inlined(s) => s.deref().to_owned().into(),
-        })
-    }
+        let get_indent = |level: usize| {
+            if level < 1 {
+                String::new()
+            } else {
+                Self::INDENT.repeat(level - 1)
+            }
+        };
 
-    let text_style = theme.map(|theme| theme.get("ui.text")).unwrap_or_default();
+        let get_theme = |key: &str| -> Style { theme.map(|t| t.get(key)).unwrap_or_default() };
+        let text_style = get_theme(Self::TEXT_STYLE);
+        let code_style = get_theme(Self::BLOCK_STYLE);
+        let heading_styles: Vec<Style> = Self::HEADING_STYLES
+            .iter()
+            .map(|key| get_theme(key))
+            .collect();
 
-    // TODO: use better scopes for these, `markup.raw.block`, `markup.heading`
-    let code_style = theme
-        .map(|theme| theme.get("ui.text.focus"))
-        .unwrap_or_default(); // white
-    let heading_style = theme
-        .map(|theme| theme.get("ui.linenr.selected"))
-        .unwrap_or_default(); // lilac
+        // Transform text in `<code>` blocks into `Event::Code`
+        let mut in_code = false;
+        let parser = parser.filter_map(|event| match event {
+            Event::Html(tag) if *tag == *"<code>" => {
+                in_code = true;
+                None
+            }
+            Event::Html(tag) if *tag == *"</code>" => {
+                in_code = false;
+                None
+            }
+            Event::Text(text) if in_code => Some(Event::Code(text)),
+            _ => Some(event),
+        });
 
-    for event in parser {
-        match event {
-            Event::Start(tag) => tags.push(tag),
-            Event::End(tag) => {
-                tags.pop();
-                match tag {
-                    Tag::Heading(_) | Tag::Paragraph | Tag::CodeBlock(CodeBlockKind::Fenced(_)) => {
-                        // whenever code block or paragraph closes, new line
-                        let spans = std::mem::take(&mut spans);
-                        if !spans.is_empty() {
-                            lines.push(Spans::from(spans));
-                        }
+        for event in parser {
+            match event {
+                Event::Start(Tag::List(list)) => {
+                    // if the list stack is not empty this is a sub list, in that
+                    // case we need to push the current line before proceeding
+                    if !list_stack.is_empty() {
+                        push_line(&mut spans, &mut lines);
+                    }
+
+                    list_stack.push(list);
+                }
+                Event::End(Tag::List(_)) => {
+                    list_stack.pop();
+
+                    // whenever top-level list closes, empty line
+                    if list_stack.is_empty() {
                         lines.push(Spans::default());
                     }
-                    _ => (),
                 }
-            }
-            Event::Text(text) => {
-                // TODO: temp workaround
-                if let Some(Tag::CodeBlock(CodeBlockKind::Fenced(language))) = tags.last() {
-                    if let Some(theme) = theme {
-                        let rope = Rope::from(text.as_ref());
-                        let syntax = loader
-                            .language_configuration_for_injection_string(language)
-                            .and_then(|config| config.highlight_config(theme.scopes()))
-                            .map(|config| Syntax::new(&rope, config));
+                Event::Start(Tag::Item) => {
+                    if list_stack.is_empty() {
+                        log::warn!("markdown parsing error, list item without list");
+                    }
 
-                        if let Some(syntax) = syntax {
-                            // if we have a syntax available, highlight_iter and generate spans
-                            let mut highlights = Vec::new();
+                    tags.push(Tag::Item);
 
-                            for event in syntax.highlight_iter(rope.slice(..), None, None, |_| None)
-                            {
-                                match event.unwrap() {
-                                    HighlightEvent::HighlightStart(span) => {
-                                        highlights.push(span);
-                                    }
-                                    HighlightEvent::HighlightEnd => {
-                                        highlights.pop();
-                                    }
-                                    HighlightEvent::Source { start, end } => {
-                                        let style = match highlights.first() {
-                                            Some(span) => theme.get(&theme.scopes()[span.0]),
-                                            None => text_style,
-                                        };
+                    // get the appropriate bullet for the current list
+                    let bullet = list_stack
+                        .last()
+                        .unwrap_or(&None) // use the '- ' bullet in case the list stack would be empty
+                        .map_or(String::from("- "), |number| format!("{}. ", number));
 
-                                        // TODO: replace tabs with indentation
+                    // increment the current list number if there is one
+                    if let Some(v) = list_stack.last_mut().unwrap_or(&mut None).as_mut() {
+                        *v += 1;
+                    }
 
-                                        let mut slice = &text[start..end];
-                                        // TODO: do we need to handle all unicode line endings
-                                        // here, or is just '\n' okay?
-                                        while let Some(end) = slice.find('\n') {
-                                            // emit span up to newline
-                                            let text = &slice[..end];
-                                            let text = text.replace('\t', "    "); // replace tabs
-                                            let span = Span::styled(text, style);
-                                            spans.push(span);
+                    let prefix = get_indent(list_stack.len()) + bullet.as_str();
+                    spans.push(Span::from(prefix));
+                }
+                Event::Start(tag) => {
+                    tags.push(tag);
+                    if spans.is_empty() && !list_stack.is_empty() {
+                        // TODO: could push indent + 2 or 3 spaces to align with
+                        // the rest of the list.
+                        spans.push(Span::from(get_indent(list_stack.len())));
+                    }
+                }
+                Event::End(tag) => {
+                    tags.pop();
+                    match tag {
+                        Tag::Heading(_, _, _) | Tag::Paragraph | Tag::CodeBlock(_) | Tag::Item => {
+                            push_line(&mut spans, &mut lines);
+                        }
+                        _ => (),
+                    }
 
-                                            // truncate slice to after newline
-                                            slice = &slice[end + 1..];
-
-                                            // make a new line
-                                            let spans = std::mem::take(&mut spans);
-                                            lines.push(Spans::from(spans));
-                                        }
-
-                                        // if there's anything left, emit it too
-                                        if !slice.is_empty() {
-                                            let span =
-                                                Span::styled(slice.replace('\t', "    "), style);
-                                            spans.push(span);
-                                        }
-                                    }
-                                }
+                    // whenever heading, code block or paragraph closes, empty line
+                    match tag {
+                        Tag::Heading(_, _, _) | Tag::Paragraph | Tag::CodeBlock(_) => {
+                            lines.push(Spans::default());
+                        }
+                        _ => (),
+                    }
+                }
+                Event::Text(text) => {
+                    if let Some(Tag::CodeBlock(kind)) = tags.last() {
+                        let language = match kind {
+                            CodeBlockKind::Fenced(language) => language,
+                            CodeBlockKind::Indented => "",
+                        };
+                        let tui_text = highlighted_code_block(
+                            text.to_string(),
+                            language,
+                            theme,
+                            Arc::clone(&self.config_loader),
+                            None,
+                        );
+                        lines.extend(tui_text.lines.into_iter());
+                    } else {
+                        let style = if let Some(Tag::Heading(level, ..)) = tags.last() {
+                            match level {
+                                HeadingLevel::H1 => heading_styles[0],
+                                HeadingLevel::H2 => heading_styles[1],
+                                HeadingLevel::H3 => heading_styles[2],
+                                HeadingLevel::H4 => heading_styles[3],
+                                HeadingLevel::H5 => heading_styles[4],
+                                HeadingLevel::H6 => heading_styles[5],
                             }
                         } else {
-                            for line in text.lines() {
-                                let span = Span::styled(line.to_string(), code_style);
-                                lines.push(Spans::from(span));
-                            }
-                        }
-                    } else {
-                        for line in text.lines() {
-                            let span = Span::styled(line.to_string(), code_style);
-                            lines.push(Spans::from(span));
-                        }
+                            text_style
+                        };
+                        spans.push(Span::styled(text, style));
                     }
-                } else if let Some(Tag::Heading(_)) = tags.last() {
-                    let mut span = to_span(text);
-                    span.style = heading_style;
-                    spans.push(span);
-                } else {
-                    let mut span = to_span(text);
-                    span.style = text_style;
-                    spans.push(span);
+                }
+                Event::Code(text) | Event::Html(text) => {
+                    spans.push(Span::styled(text, code_style));
+                }
+                Event::SoftBreak | Event::HardBreak => {
+                    push_line(&mut spans, &mut lines);
+                    if !list_stack.is_empty() {
+                        // TODO: could push indent + 2 or 3 spaces to align with
+                        // the rest of the list.
+                        spans.push(Span::from(get_indent(list_stack.len())));
+                    }
+                }
+                Event::Rule => {
+                    lines.push(Spans::from(Span::styled("---", code_style)));
+                    lines.push(Spans::default());
+                }
+                // TaskListMarker(bool) true if checked
+                _ => {
+                    log::warn!("unhandled markdown event {:?}", event);
                 }
             }
-            Event::Code(text) | Event::Html(text) => {
-                let mut span = to_span(text);
-                span.style = code_style;
-                spans.push(span);
-            }
-            Event::SoftBreak | Event::HardBreak => {
-                // let spans = std::mem::replace(&mut spans, Vec::new());
-                // lines.push(Spans::from(spans));
-                spans.push(Span::raw(" "));
-            }
-            Event::Rule => {
-                let mut span = Span::raw("---");
-                span.style = code_style;
-                lines.push(Spans::from(span));
-                lines.push(Spans::default());
-            }
-            // TaskListMarker(bool) true if checked
-            _ => {
-                log::warn!("unhandled markdown event {:?}", event);
+            // build up a vec of Paragraph tui widgets
+        }
+
+        if !spans.is_empty() {
+            lines.push(Spans::from(spans));
+        }
+
+        // if last line is empty, remove it
+        if let Some(line) = lines.last() {
+            if line.0.is_empty() {
+                lines.pop();
             }
         }
-        // build up a vec of Paragraph tui widgets
-    }
 
-    if !spans.is_empty() {
-        lines.push(Spans::from(spans));
+        Text::from(lines)
     }
-
-    // if last line is empty, remove it
-    if let Some(line) = lines.last() {
-        if line.0.is_empty() {
-            lines.pop();
-        }
-    }
-
-    Text::from(lines)
 }
+
 impl Component for Markdown {
     fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         use tui::widgets::{Paragraph, Widget, Wrap};
 
-        let text = parse(&self.contents, Some(&cx.editor.theme), &self.config_loader);
+        let text = self.parse(Some(&cx.editor.theme));
 
         let par = Paragraph::new(text)
             .wrap(Wrap { trim: false })
             .scroll((cx.scroll.unwrap_or_default() as u16, 0));
 
-        let margin = Margin {
-            vertical: 1,
-            horizontal: 1,
-        };
+        let margin = Margin::all(1);
         par.render(area.inner(&margin), surface);
     }
 
@@ -227,22 +345,12 @@ impl Component for Markdown {
         if padding >= viewport.1 || padding >= viewport.0 {
             return None;
         }
-        let contents = parse(&self.contents, None, &self.config_loader);
+        let contents = self.parse(None);
+
         // TODO: account for tab width
         let max_text_width = (viewport.0 - padding).min(120);
-        let mut text_width = 0;
-        let mut height = padding;
-        for content in contents {
-            height += 1;
-            let content_width = content.width() as u16;
-            if content_width > max_text_width {
-                text_width = max_text_width;
-                height += content_width / max_text_width;
-            } else if content_width > text_width {
-                text_width = content_width;
-            }
-        }
+        let (width, height) = crate::ui::text::required_size(&contents, max_text_width);
 
-        Some((text_width + padding, height))
+        Some((width + padding, height + padding))
     }
 }

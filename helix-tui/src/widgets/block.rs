@@ -6,7 +6,8 @@ use crate::{
 };
 use helix_view::graphics::{Rect, Style};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Border render type. Defaults to [`BorderType::Plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BorderType {
     Plain,
     Rounded,
@@ -15,13 +16,19 @@ pub enum BorderType {
 }
 
 impl BorderType {
-    pub fn line_symbols(border_type: BorderType) -> line::Set {
+    pub fn line_symbols(border_type: Self) -> line::Set {
         match border_type {
-            BorderType::Plain => line::NORMAL,
-            BorderType::Rounded => line::ROUNDED,
-            BorderType::Double => line::DOUBLE,
-            BorderType::Thick => line::THICK,
+            Self::Plain => line::NORMAL,
+            Self::Rounded => line::ROUNDED,
+            Self::Double => line::DOUBLE,
+            Self::Thick => line::THICK,
         }
+    }
+}
+
+impl Default for BorderType {
+    fn default() -> BorderType {
+        BorderType::Plain
     }
 }
 
@@ -40,7 +47,7 @@ impl BorderType {
 ///     .border_type(BorderType::Rounded)
 ///     .style(Style::default().bg(Color::Black));
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Block<'a> {
     /// Optional title place on the upper left of the block
     title: Option<Spans<'a>>,
@@ -53,18 +60,6 @@ pub struct Block<'a> {
     border_type: BorderType,
     /// Widget style
     style: Style,
-}
-
-impl<'a> Default for Block<'a> {
-    fn default() -> Block<'a> {
-        Block {
-            title: None,
-            borders: Borders::NONE,
-            border_style: Default::default(),
-            border_type: BorderType::Plain,
-            style: Default::default(),
-        }
-    }
 }
 
 impl<'a> Block<'a> {
@@ -82,7 +77,7 @@ impl<'a> Block<'a> {
     )]
     pub fn title_style(mut self, style: Style) -> Block<'a> {
         if let Some(t) = self.title {
-            let title = String::from(t);
+            let title = String::from(&t);
             self.title = Some(Spans::from(Span::styled(title, style)));
         }
         self
@@ -140,14 +135,14 @@ impl<'a> Widget for Block<'a> {
         // Sides
         if self.borders.intersects(Borders::LEFT) {
             for y in area.top()..area.bottom() {
-                buf.get_mut(area.left(), y)
+                buf[(area.left(), y)]
                     .set_symbol(symbols.vertical)
                     .set_style(self.border_style);
             }
         }
         if self.borders.intersects(Borders::TOP) {
             for x in area.left()..area.right() {
-                buf.get_mut(x, area.top())
+                buf[(x, area.top())]
                     .set_symbol(symbols.horizontal)
                     .set_style(self.border_style);
             }
@@ -155,7 +150,7 @@ impl<'a> Widget for Block<'a> {
         if self.borders.intersects(Borders::RIGHT) {
             let x = area.right() - 1;
             for y in area.top()..area.bottom() {
-                buf.get_mut(x, y)
+                buf[(x, y)]
                     .set_symbol(symbols.vertical)
                     .set_style(self.border_style);
             }
@@ -163,7 +158,7 @@ impl<'a> Widget for Block<'a> {
         if self.borders.intersects(Borders::BOTTOM) {
             let y = area.bottom() - 1;
             for x in area.left()..area.right() {
-                buf.get_mut(x, y)
+                buf[(x, y)]
                     .set_symbol(symbols.horizontal)
                     .set_style(self.border_style);
             }
@@ -171,37 +166,29 @@ impl<'a> Widget for Block<'a> {
 
         // Corners
         if self.borders.contains(Borders::RIGHT | Borders::BOTTOM) {
-            buf.get_mut(area.right() - 1, area.bottom() - 1)
+            buf[(area.right() - 1, area.bottom() - 1)]
                 .set_symbol(symbols.bottom_right)
                 .set_style(self.border_style);
         }
         if self.borders.contains(Borders::RIGHT | Borders::TOP) {
-            buf.get_mut(area.right() - 1, area.top())
+            buf[(area.right() - 1, area.top())]
                 .set_symbol(symbols.top_right)
                 .set_style(self.border_style);
         }
         if self.borders.contains(Borders::LEFT | Borders::BOTTOM) {
-            buf.get_mut(area.left(), area.bottom() - 1)
+            buf[(area.left(), area.bottom() - 1)]
                 .set_symbol(symbols.bottom_left)
                 .set_style(self.border_style);
         }
         if self.borders.contains(Borders::LEFT | Borders::TOP) {
-            buf.get_mut(area.left(), area.top())
+            buf[(area.left(), area.top())]
                 .set_symbol(symbols.top_left)
                 .set_style(self.border_style);
         }
 
         if let Some(title) = self.title {
-            let lx = if self.borders.intersects(Borders::LEFT) {
-                1
-            } else {
-                0
-            };
-            let rx = if self.borders.intersects(Borders::RIGHT) {
-                1
-            } else {
-                0
-            };
+            let lx = u16::from(self.borders.intersects(Borders::LEFT));
+            let rx = u16::from(self.borders.intersects(Borders::RIGHT));
             let width = area.width.saturating_sub(lx).saturating_sub(rx);
             buf.set_spans(area.left() + lx, area.top(), &title, width);
         }

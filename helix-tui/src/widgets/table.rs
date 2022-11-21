@@ -34,7 +34,7 @@ use std::collections::HashMap;
 ///
 /// You can apply a [`Style`] on the entire [`Cell`] using [`Cell::style`] or rely on the styling
 /// capabilities of [`Text`].
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Cell<'a> {
     pub content: Text<'a>,
     style: Style,
@@ -68,7 +68,7 @@ where
 /// Row::new(vec!["Cell1", "Cell2", "Cell3"]);
 /// ```
 ///
-/// But if you need a bit more control over individual cells, you can explicity create [`Cell`]s:
+/// But if you need a bit more control over individual cells, you can explicitly create [`Cell`]s:
 /// ```rust
 /// # use helix_tui::widgets::{Row, Cell};
 /// # use helix_view::graphics::{Style, Color};
@@ -79,7 +79,7 @@ where
 /// ```
 ///
 /// By default, a row has a height of 1 but you can change this using [`Row::height`].
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row<'a> {
     pub cells: Vec<Cell<'a>>,
     height: u16,
@@ -109,7 +109,7 @@ impl<'a> Row<'a> {
         self
     }
 
-    /// Set the [`Style`] of the entire row. This [`Style`] can be overriden by the [`Style`] of a
+    /// Set the [`Style`] of the entire row. This [`Style`] can be overridden by the [`Style`] of a
     /// any individual [`Cell`] or event by their [`Text`] content.
     pub fn style(mut self, style: Style) -> Self {
         self.style = style;
@@ -179,7 +179,7 @@ impl<'a> Row<'a> {
 /// // ...and potentially show a symbol in front of the selection.
 /// .highlight_symbol(">>");
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table<'a> {
     /// A block to wrap the widget in
     block: Option<Block<'a>>,

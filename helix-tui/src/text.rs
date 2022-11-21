@@ -53,14 +53,14 @@ use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
 
 /// A grapheme associated to a style.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledGrapheme<'a> {
     pub symbol: &'a str,
     pub style: Style,
 }
 
 /// A string where all graphemes have the same style.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Span<'a> {
     pub content: Cow<'a, str>,
     pub style: Style,
@@ -134,6 +134,8 @@ impl<'a> Span<'a> {
     ///             style: Style {
     ///                 fg: Some(Color::Yellow),
     ///                 bg: Some(Color::Black),
+    ///                 underline_color: None,
+    ///                 underline_style: None,
     ///                 add_modifier: Modifier::empty(),
     ///                 sub_modifier: Modifier::empty(),
     ///             },
@@ -143,6 +145,8 @@ impl<'a> Span<'a> {
     ///             style: Style {
     ///                 fg: Some(Color::Yellow),
     ///                 bg: Some(Color::Black),
+    ///                 underline_color: None,
+    ///                 underline_style: None,
     ///                 add_modifier: Modifier::empty(),
     ///                 sub_modifier: Modifier::empty(),
     ///             },
@@ -152,6 +156,8 @@ impl<'a> Span<'a> {
     ///             style: Style {
     ///                 fg: Some(Color::Yellow),
     ///                 bg: Some(Color::Black),
+    ///                 underline_color: None,
+    ///                 underline_style: None,
     ///                 add_modifier: Modifier::empty(),
     ///                 sub_modifier: Modifier::empty(),
     ///             },
@@ -161,6 +167,8 @@ impl<'a> Span<'a> {
     ///             style: Style {
     ///                 fg: Some(Color::Yellow),
     ///                 bg: Some(Color::Black),
+    ///                 underline_color: None,
+    ///                 underline_style: None,
     ///                 add_modifier: Modifier::empty(),
     ///                 sub_modifier: Modifier::empty(),
     ///             },
@@ -194,8 +202,14 @@ impl<'a> From<&'a str> for Span<'a> {
     }
 }
 
+impl<'a> From<Cow<'a, str>> for Span<'a> {
+    fn from(s: Cow<'a, str>) -> Span<'a> {
+        Span::raw(s)
+    }
+}
+
 /// A string composed of clusters of graphemes, each with their own style.
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Spans<'a>(pub Vec<Span<'a>>);
 
 impl<'a> Spans<'a> {
@@ -229,6 +243,12 @@ impl<'a> From<&'a str> for Spans<'a> {
     }
 }
 
+impl<'a> From<Cow<'a, str>> for Spans<'a> {
+    fn from(s: Cow<'a, str>) -> Spans<'a> {
+        Spans(vec![Span::raw(s)])
+    }
+}
+
 impl<'a> From<Vec<Span<'a>>> for Spans<'a> {
     fn from(spans: Vec<Span<'a>>) -> Spans<'a> {
         Spans(spans)
@@ -243,10 +263,13 @@ impl<'a> From<Span<'a>> for Spans<'a> {
 
 impl<'a> From<Spans<'a>> for String {
     fn from(line: Spans<'a>) -> String {
-        line.0.iter().fold(String::new(), |mut acc, s| {
-            acc.push_str(s.content.as_ref());
-            acc
-        })
+        line.0.iter().map(|s| &*s.content).collect()
+    }
+}
+
+impl<'a> From<&Spans<'a>> for String {
+    fn from(line: &Spans<'a>) -> String {
+        line.0.iter().map(|s| &*s.content).collect()
     }
 }
 
@@ -274,7 +297,7 @@ impl<'a> From<Spans<'a>> for String {
 /// text.extend(Text::styled("Some more lines\nnow with more style!", style));
 /// assert_eq!(6, text.height());
 /// ```
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Text<'a> {
     pub lines: Vec<Spans<'a>>,
 }
@@ -383,6 +406,12 @@ impl<'a> From<String> for Text<'a> {
 
 impl<'a> From<&'a str> for Text<'a> {
     fn from(s: &'a str) -> Text<'a> {
+        Text::raw(s)
+    }
+}
+
+impl<'a> From<Cow<'a, str>> for Text<'a> {
+    fn from(s: Cow<'a, str>) -> Text<'a> {
         Text::raw(s)
     }
 }

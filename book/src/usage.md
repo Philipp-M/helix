@@ -2,7 +2,7 @@
 
 (Currently not fully documented, see the [keymappings](./keymap.md) list for more.)
 
-See [tutor.txt](https://github.com/helix-editor/helix/blob/master/runtime/tutor.txt) (accessible via `hx --tutor` or `:tutor`) for a vimtutor-like introduction.
+See [tutor](https://github.com/helix-editor/helix/blob/master/runtime/tutor) (accessible via `hx --tutor` or `:tutor`) for a vimtutor-like introduction.
 
 ## Registers
 
@@ -42,7 +42,7 @@ helix. The keymappings have been inspired from [vim-sandwich](https://github.com
 `ms` acts on a selection, so select the text first and use `ms<char>`. `mr` and `md` work
 on the closest pairs found and selections are not required; use counts to act in outer pairs.
 
-It can also act on multiple seletions (yay!). For example, to change every occurance of `(use)` to `[use]`:
+It can also act on multiple selections (yay!). For example, to change every occurrence of `(use)` to `[use]`:
 
 - `%` to select the whole file
 - `s` to split the selections on a search term
@@ -51,26 +51,119 @@ It can also act on multiple seletions (yay!). For example, to change every occur
 
 Multiple characters are currently not supported, but planned.
 
-## Textobjects
+## Syntax-tree Motions
 
-Currently supported: `word`, `surround`, `function`, `class`, `parameter`.
+`Alt-p`, `Alt-o`, `Alt-i`, and `Alt-n` (or `Alt` and arrow keys) move the primary
+selection according to the selection's place in the syntax tree. Let's walk
+through an example to get familiar with them. Many languages have a syntax like
+so for function calls:
+
+```
+func(arg1, arg2, arg3)
+```
+
+A function call might be parsed by tree-sitter into a tree like the following.
+
+```tsq
+(call
+  function: (identifier) ; func
+  arguments:
+    (arguments           ; (arg1, arg2, arg3)
+      (identifier)       ; arg1
+      (identifier)       ; arg2
+      (identifier)))     ; arg3
+```
+
+Use `:tree-sitter-subtree` to view the syntax tree of the primary selection. In
+a more intuitive tree format:
+
+```
+            ┌────┐
+            │call│
+      ┌─────┴────┴─────┐
+      │                │
+┌─────▼────┐      ┌────▼────┐
+│identifier│      │arguments│
+│  "func"  │ ┌────┴───┬─────┴───┐
+└──────────┘ │        │         │
+             │        │         │
+   ┌─────────▼┐  ┌────▼─────┐  ┌▼─────────┐
+   │identifier│  │identifier│  │identifier│
+   │  "arg1"  │  │  "arg2"  │  │  "arg3"  │
+   └──────────┘  └──────────┘  └──────────┘
+```
+
+Say we have a selection that wraps `arg1`. The selection is on the `arg1` leaf
+in the tree above.
+
+```
+func([arg1], arg2, arg3)
+```
+
+Using `Alt-n` would select the next sibling in the syntax tree: `arg2`.
+
+```
+func(arg1, [arg2], arg3)
+```
+
+While `Alt-o` would expand the selection to the parent node. In the tree above we
+can see that we would select the `arguments` node.
+
+```
+func[(arg1, arg2, arg3)]
+```
+
+There is also some nuanced behavior that prevents you from getting stuck on a
+node with no sibling. If we have a selection on `arg1`, `Alt-p` would bring us
+to the previous child node. Since `arg1` doesn't have a sibling to its left,
+though, we climb the syntax tree and then take the previous selection. So
+`Alt-p` will move the selection over to the "func" `identifier`.
+
+```
+[func](arg1, arg2, arg3)
+```
+
+## Textobjects
 
 ![textobject-demo](https://user-images.githubusercontent.com/23398472/124231131-81a4bb00-db2d-11eb-9d10-8e577ca7b177.gif)
 ![textobject-treesitter-demo](https://user-images.githubusercontent.com/23398472/132537398-2a2e0a54-582b-44ab-a77f-eb818942203d.gif)
 
-- `ma` - Select around the object (`va` in vim, `<alt-a>` in kakoune)
-- `mi` - Select inside the object (`vi` in vim, `<alt-i>` in kakoune)
+- `ma` - Select around the object (`va` in Vim, `<alt-a>` in Kakoune)
+- `mi` - Select inside the object (`vi` in Vim, `<alt-i>` in Kakoune)
 
 | Key after `mi` or `ma` | Textobject selected      |
 | ---                    | ---                      |
 | `w`                    | Word                     |
 | `W`                    | WORD                     |
+| `p`                    | Paragraph                |
 | `(`, `[`, `'`, etc     | Specified surround pairs |
+| `m`                    | Closest surround pair    |
 | `f`                    | Function                 |
 | `c`                    | Class                    |
-| `p`                    | Parameter                |
+| `a`                    | Argument/parameter       |
+| `o`                    | Comment                  |
+| `t`                    | Test                     |
 
-Note: `f`, `c`, etc need a tree-sitter grammar active for the current
+> NOTE: `f`, `c`, etc need a tree-sitter grammar active for the current
 document and a special tree-sitter query file to work properly. [Only
-some grammars](https://github.com/search?q=repo%3Ahelix-editor%2Fhelix+filename%3Atextobjects.scm&type=Code&ref=advsearch&l=&l=)
-currently have the query file implemented. Contributions are welcome !
+some grammars][lang-support] currently have the query file implemented.
+Contributions are welcome!
+
+## Tree-sitter Textobject Based Navigation
+
+Navigating between functions, classes, parameters, etc is made
+possible by leveraging tree-sitter and textobjects queries. For
+example to move to the next function use `]f`, to move to previous
+class use `[c`, and so on.
+
+![tree-sitter-nav-demo][tree-sitter-nav-demo]
+
+See the [unimpaired][unimpaired-keybinds] section of the keybind
+documentation for the full reference.
+
+> NOTE: This feature is dependent on tree-sitter based textobjects
+and therefore requires the corresponding query file to work properly.
+
+[lang-support]: ./lang-support.md
+[unimpaired-keybinds]: ./keymap.md#unimpaired
+[tree-sitter-nav-demo]: https://user-images.githubusercontent.com/23398472/152332550-7dfff043-36a2-4aec-b8f2-77c13eb56d6f.gif

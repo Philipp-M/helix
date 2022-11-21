@@ -5,6 +5,7 @@ use ropey::RopeSlice;
 
 use std::borrow::Cow;
 use std::cmp;
+use std::fmt::Write;
 
 use super::Increment;
 use crate::{Range, Tendril};
@@ -73,12 +74,12 @@ impl DateTimeIncrementor {
                 (true, false) => {
                     let date = NaiveDate::parse_from_str(date_time, format.fmt).ok()?;
 
-                    date.and_hms(0, 0, 0)
+                    date.and_hms_opt(0, 0, 0).unwrap()
                 }
                 (false, true) => {
                     let time = NaiveTime::parse_from_str(date_time, format.fmt).ok()?;
 
-                    NaiveDate::from_ymd(0, 1, 1).and_time(time)
+                    NaiveDate::from_ymd_opt(0, 1, 1).unwrap().and_time(time)
                 }
                 (false, false) => return None,
             };
@@ -162,7 +163,7 @@ impl Format {
             fields.push(field);
             max_len += field.max_len + remaining[..i].len();
             regex += &remaining[..i];
-            regex += &format!("({})", field.regex);
+            write!(regex, "({})", field.regex).unwrap();
             remaining = &after[spec_len..];
         }
 
@@ -195,82 +196,82 @@ struct DateField {
 impl DateField {
     fn from_specifier(specifier: &str) -> Option<Self> {
         match specifier {
-            "Y" => Some(DateField {
+            "Y" => Some(Self {
                 regex: r"\d{4}",
                 unit: DateUnit::Years,
                 max_len: 5,
             }),
-            "y" => Some(DateField {
+            "y" => Some(Self {
                 regex: r"\d\d",
                 unit: DateUnit::Years,
                 max_len: 2,
             }),
-            "m" => Some(DateField {
+            "m" => Some(Self {
                 regex: r"[0-1]\d",
                 unit: DateUnit::Months,
                 max_len: 2,
             }),
-            "d" => Some(DateField {
+            "d" => Some(Self {
                 regex: r"[0-3]\d",
                 unit: DateUnit::Days,
                 max_len: 2,
             }),
-            "-d" => Some(DateField {
+            "-d" => Some(Self {
                 regex: r"[1-3]?\d",
                 unit: DateUnit::Days,
                 max_len: 2,
             }),
-            "a" => Some(DateField {
+            "a" => Some(Self {
                 regex: r"Sun|Mon|Tue|Wed|Thu|Fri|Sat",
                 unit: DateUnit::Days,
                 max_len: 3,
             }),
-            "A" => Some(DateField {
+            "A" => Some(Self {
                 regex: r"Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday",
                 unit: DateUnit::Days,
                 max_len: 9,
             }),
-            "b" | "h" => Some(DateField {
+            "b" | "h" => Some(Self {
                 regex: r"Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec",
                 unit: DateUnit::Months,
                 max_len: 3,
             }),
-            "B" => Some(DateField {
+            "B" => Some(Self {
                 regex: r"January|February|March|April|May|June|July|August|September|October|November|December",
                 unit: DateUnit::Months,
                 max_len: 9,
             }),
-            "H" => Some(DateField {
+            "H" => Some(Self {
                 regex: r"[0-2]\d",
                 unit: DateUnit::Hours,
                 max_len: 2,
             }),
-            "M" => Some(DateField {
+            "M" => Some(Self {
                 regex: r"[0-5]\d",
                 unit: DateUnit::Minutes,
                 max_len: 2,
             }),
-            "S" => Some(DateField {
+            "S" => Some(Self {
                 regex: r"[0-5]\d",
                 unit: DateUnit::Seconds,
                 max_len: 2,
             }),
-            "I" => Some(DateField {
+            "I" => Some(Self {
                 regex: r"[0-1]\d",
                 unit: DateUnit::Hours,
                 max_len: 2,
             }),
-            "-I" => Some(DateField {
+            "-I" => Some(Self {
                 regex: r"1?\d",
                 unit: DateUnit::Hours,
                 max_len: 2,
             }),
-            "P" => Some(DateField {
+            "P" => Some(Self {
                 regex: r"am|pm",
                 unit: DateUnit::AmPm,
                 max_len: 2,
             }),
-            "p" => Some(DateField {
+            "p" => Some(Self {
                 regex: r"AM|PM",
                 unit: DateUnit::AmPm,
                 max_len: 2,
@@ -311,10 +312,10 @@ fn ndays_in_month(year: i32, month: u32) -> u32 {
     } else {
         (year, month + 1)
     };
-    let d = NaiveDate::from_ymd(y, m, 1);
+    let d = NaiveDate::from_ymd_opt(y, m, 1).unwrap();
 
     // ...is preceded by the last day of the original month.
-    d.pred().day()
+    d.pred_opt().unwrap().day()
 }
 
 fn add_months(date_time: NaiveDateTime, amount: i64) -> Option<NaiveDateTime> {
@@ -333,7 +334,7 @@ fn add_months(date_time: NaiveDateTime, amount: i64) -> Option<NaiveDateTime> {
 
     let day = cmp::min(date_time.day(), ndays_in_month(year, month));
 
-    Some(NaiveDate::from_ymd(year, month, day).and_time(date_time.time()))
+    NaiveDate::from_ymd_opt(year, month, day).map(|date| date.and_time(date_time.time()))
 }
 
 fn add_years(date_time: NaiveDateTime, amount: i64) -> Option<NaiveDateTime> {
@@ -341,8 +342,8 @@ fn add_years(date_time: NaiveDateTime, amount: i64) -> Option<NaiveDateTime> {
     let ndays = ndays_in_month(year, date_time.month());
 
     if date_time.day() > ndays {
-        let d = NaiveDate::from_ymd(year, date_time.month(), ndays);
-        Some(d.succ().and_time(date_time.time()))
+        NaiveDate::from_ymd_opt(year, date_time.month(), ndays)
+            .and_then(|date| date.succ_opt().map(|date| date.and_time(date_time.time())))
     } else {
         date_time.with_year(year)
     }
@@ -451,7 +452,7 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }

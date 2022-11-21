@@ -1,12 +1,12 @@
 use crate::{
-    compositor::{Component, Compositor, Context, EventResult},
+    commands::Open,
+    compositor::{Callback, Component, Context, Event, EventResult},
     ctrl, key,
 };
-use crossterm::event::Event;
 use tui::buffer::Buffer as Surface;
 
 use helix_core::Position;
-use helix_view::graphics::Rect;
+use helix_view::graphics::{Margin, Rect};
 
 // TODO: share logic with Menu, it's essentially Popup(render_fn), but render fn needs to return
 // a width/height hint. maybe Popup(Box<Component>)
@@ -14,10 +14,15 @@ use helix_view::graphics::Rect;
 pub struct Popup<T: Component> {
     contents: T,
     position: Option<Position>,
+    margin: Margin,
     size: (u16, u16),
     child_size: (u16, u16),
+    position_bias: Open,
     scroll: usize,
+    auto_close: bool,
+    ignore_escape_key: bool,
     id: &'static str,
+    has_scrollbar: bool,
 }
 
 impl<T: Component> Popup<T> {
@@ -25,15 +30,52 @@ impl<T: Component> Popup<T> {
         Self {
             contents,
             position: None,
+            margin: Margin::none(),
             size: (0, 0),
+            position_bias: Open::Below,
             child_size: (0, 0),
             scroll: 0,
+            auto_close: false,
+            ignore_escape_key: false,
             id,
+            has_scrollbar: true,
         }
     }
 
-    pub fn set_position(&mut self, pos: Option<Position>) {
+    pub fn position(mut self, pos: Option<Position>) -> Self {
         self.position = pos;
+        self
+    }
+
+    pub fn get_position(&self) -> Option<Position> {
+        self.position
+    }
+
+    pub fn position_bias(mut self, bias: Open) -> Self {
+        self.position_bias = bias;
+        self
+    }
+
+    pub fn margin(mut self, margin: Margin) -> Self {
+        self.margin = margin;
+        self
+    }
+
+    pub fn auto_close(mut self, auto_close: bool) -> Self {
+        self.auto_close = auto_close;
+        self
+    }
+
+    /// Ignores an escape keypress event, letting the outer layer
+    /// (usually the editor) handle it. This is useful for popups
+    /// in insert mode like completion and signature help where
+    /// the popup is closed on the mode change from insert to normal
+    /// which is done with the escape key. Otherwise the popup consumes
+    /// the escape key event and closes it, and an additional escape
+    /// would be required to exit insert mode.
+    pub fn ignore_escape_key(mut self, ignore: bool) -> Self {
+        self.ignore_escape_key = ignore;
+        self
     }
 
     pub fn get_rel_position(&mut self, viewport: Rect, cx: &Context) -> (u16, u16) {
@@ -54,13 +96,23 @@ impl<T: Component> Popup<T> {
             rel_x = rel_x.saturating_sub((rel_x + width).saturating_sub(viewport.width));
         }
 
-        // TODO: be able to specify orientation preference. We want above for most popups, below
-        // for menus/autocomplete.
-        if viewport.height > rel_y + height {
-            rel_y += 1 // position below point
-        } else {
-            rel_y = rel_y.saturating_sub(height) // position above point
-        }
+        let can_put_below = viewport.height > rel_y + height;
+        let can_put_above = rel_y.checked_sub(height).is_some();
+        let final_pos = match self.position_bias {
+            Open::Below => match can_put_below {
+                true => Open::Below,
+                false => Open::Above,
+            },
+            Open::Above => match can_put_above {
+                true => Open::Above,
+                false => Open::Below,
+            },
+        };
+
+        rel_y = match final_pos {
+            Open::Above => rel_y.saturating_sub(height),
+            Open::Below => rel_y + 1,
+        };
 
         (rel_x, rel_y)
     }
@@ -71,13 +123,19 @@ impl<T: Component> Popup<T> {
 
     pub fn scroll(&mut self, offset: usize, direction: bool) {
         if direction {
-            self.scroll += offset;
-
             let max_offset = self.child_size.1.saturating_sub(self.size.1);
             self.scroll = (self.scroll + offset).min(max_offset as usize);
         } else {
             self.scroll = self.scroll.saturating_sub(offset);
         }
+    }
+
+    /// Toggles the Popup's scrollbar.
+    /// Consider disabling the scrollbar in case the child
+    /// already has its own.
+    pub fn with_scrollbar(mut self, enable_scrollbar: bool) -> Self {
+        self.has_scrollbar = enable_scrollbar;
+        self
     }
 
     pub fn contents(&self) -> &T {
@@ -90,24 +148,31 @@ impl<T: Component> Popup<T> {
 }
 
 impl<T: Component> Component for Popup<T> {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         let key = match event {
-            Event::Key(event) => event,
+            Event::Key(event) => *event,
             Event::Resize(_, _) => {
                 // TODO: calculate inner area, call component's handle_event with that area
-                return EventResult::Ignored;
+                return EventResult::Ignored(None);
             }
-            _ => return EventResult::Ignored,
+            _ => return EventResult::Ignored(None),
         };
 
-        let close_fn = EventResult::Consumed(Some(Box::new(|compositor: &mut Compositor, _| {
-            // remove the layer
-            compositor.pop();
-        })));
+        if key!(Esc) == key && self.ignore_escape_key {
+            return EventResult::Ignored(None);
+        }
 
-        match key.into() {
+        let close_fn: Callback = Box::new(|compositor, _| {
+            // remove the layer
+            compositor.remove(self.id.as_ref());
+        });
+
+        match key {
             // esc or ctrl-c aborts the completion and closes the menu
-            key!(Esc) | ctrl!('c') => close_fn,
+            key!(Esc) | ctrl!('c') => {
+                let _ = self.contents.handle_event(event, cx);
+                EventResult::Consumed(Some(close_fn))
+            }
             ctrl!('d') => {
                 self.scroll(self.size.1 as usize / 2, true);
                 EventResult::Consumed(None)
@@ -116,7 +181,17 @@ impl<T: Component> Component for Popup<T> {
                 self.scroll(self.size.1 as usize / 2, false);
                 EventResult::Consumed(None)
             }
-            _ => self.contents.handle_event(event, cx),
+            _ => {
+                let contents_event_result = self.contents.handle_event(event, cx);
+
+                if self.auto_close {
+                    if let EventResult::Ignored(None) = contents_event_result {
+                        return EventResult::Ignored(Some(close_fn));
+                    }
+                }
+
+                contents_event_result
+            }
         }
         // for some events, we want to process them but send ignore, specifically all input except
         // tab/enter/ctrl-k or whatever will confirm the selection/ ctrl-n/ctrl-p for scroll.
@@ -126,13 +201,18 @@ impl<T: Component> Component for Popup<T> {
         let max_width = 120.min(viewport.0);
         let max_height = 26.min(viewport.1.saturating_sub(2)); // add some spacing in the viewport
 
+        let inner = Rect::new(0, 0, max_width, max_height).inner(&self.margin);
+
         let (width, height) = self
             .contents
-            .required_size((max_width, max_height))
+            .required_size((inner.width, inner.height))
             .expect("Component needs required_size implemented in order to be embedded in a popup");
 
         self.child_size = (width, height);
-        self.size = (width.min(max_width), height.min(max_height));
+        self.size = (
+            (width + self.margin.width()).min(max_width),
+            (height + self.margin.height()).min(max_height),
+        );
 
         // re-clamp scroll offset
         let max_offset = self.child_size.1.saturating_sub(self.size.1);
@@ -156,7 +236,42 @@ impl<T: Component> Component for Popup<T> {
         let background = cx.editor.theme.get("ui.popup");
         surface.clear_with(area, background);
 
-        self.contents.render(area, surface, cx);
+        let inner = area.inner(&self.margin);
+        self.contents.render(inner, surface, cx);
+
+        // render scrollbar if contents do not fit
+        if self.has_scrollbar {
+            let win_height = inner.height as usize;
+            let len = self.child_size.1 as usize;
+            let fits = len <= win_height;
+            let scroll = self.scroll;
+            let scroll_style = cx.editor.theme.get("ui.menu.scroll");
+
+            const fn div_ceil(a: usize, b: usize) -> usize {
+                (a + b - 1) / b
+            }
+
+            if !fits {
+                let scroll_height = div_ceil(win_height.pow(2), len).min(win_height);
+                let scroll_line = (win_height - scroll_height) * scroll
+                    / std::cmp::max(1, len.saturating_sub(win_height));
+
+                let mut cell;
+                for i in 0..win_height {
+                    cell = &mut surface[(inner.right() - 1, inner.top() + i as u16)];
+
+                    cell.set_symbol("▐"); // right half block
+
+                    if scroll_line <= i && i < scroll_line + scroll_height {
+                        // Draw scroll thumb
+                        cell.set_fg(scroll_style.fg.unwrap_or(helix_view::theme::Color::Reset));
+                    } else {
+                        // Draw scroll track
+                        cell.set_fg(scroll_style.bg.unwrap_or(helix_view::theme::Color::Reset));
+                    }
+                }
+            }
+        }
     }
 
     fn id(&self) -> Option<&'static str> {

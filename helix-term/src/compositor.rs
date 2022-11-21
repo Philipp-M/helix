@@ -4,28 +4,20 @@
 use helix_core::Position;
 use helix_view::graphics::{CursorKind, Rect};
 
-use crossterm::event::Event;
 use tui::buffer::Buffer as Surface;
 
 pub type Callback = Box<dyn FnOnce(&mut Compositor, &mut Context)>;
 
-// --> EventResult should have a callback that takes a context with methods like .popup(),
-// .prompt() etc. That way we can abstract it from the renderer.
-// Q: How does this interact with popups where we need to be able to specify the rendering of the
-// popup?
-// A: It could just take a textarea.
-//
-// If Compositor was specified in the callback that's then problematic because of
-
 // Cursive-inspired
 pub enum EventResult {
-    Ignored,
+    Ignored(Option<Callback>),
     Consumed(Option<Callback>),
 }
 
+use crate::job::Jobs;
 use helix_view::Editor;
 
-use crate::job::Jobs;
+pub use helix_view::input::Event;
 
 pub struct Context<'a> {
     pub editor: &'a mut Editor,
@@ -33,10 +25,20 @@ pub struct Context<'a> {
     pub jobs: &'a mut Jobs,
 }
 
+impl<'a> Context<'a> {
+    /// Waits on all pending jobs, and then tries to flush all pending write
+    /// operations for all documents.
+    pub fn block_try_flush_writes(&mut self) -> anyhow::Result<()> {
+        tokio::task::block_in_place(|| helix_lsp::block_on(self.jobs.finish(self.editor, None)))?;
+        tokio::task::block_in_place(|| helix_lsp::block_on(self.editor.flush_writes()))?;
+        Ok(())
+    }
+}
+
 pub trait Component: Any + AnyComponent {
     /// Process input events, return true if handled.
-    fn handle_event(&mut self, _event: Event, _ctx: &mut Context) -> EventResult {
-        EventResult::Ignored
+    fn handle_event(&mut self, _event: &Event, _ctx: &mut Context) -> EventResult {
+        EventResult::Ignored(None)
     }
     // , args: ()
 
@@ -71,52 +73,28 @@ pub trait Component: Any + AnyComponent {
     }
 }
 
-use anyhow::Error;
-use std::io::stdout;
-use tui::backend::{Backend, CrosstermBackend};
-type Terminal = tui::terminal::Terminal<CrosstermBackend<std::io::Stdout>>;
-
 pub struct Compositor {
     layers: Vec<Box<dyn Component>>,
-    terminal: Terminal,
+    area: Rect,
 
     pub(crate) last_picker: Option<Box<dyn Component>>,
 }
 
 impl Compositor {
-    pub fn new() -> Result<Self, Error> {
-        let backend = CrosstermBackend::new(stdout());
-        let terminal = Terminal::new(backend)?;
-        Ok(Self {
+    pub fn new(area: Rect) -> Self {
+        Self {
             layers: Vec::new(),
-            terminal,
+            area,
             last_picker: None,
-        })
+        }
     }
 
     pub fn size(&self) -> Rect {
-        self.terminal.size().expect("couldn't get terminal size")
+        self.area
     }
 
-    pub fn resize(&mut self, width: u16, height: u16) {
-        self.terminal
-            .resize(Rect::new(0, 0, width, height))
-            .expect("Unable to resize terminal")
-    }
-
-    pub fn save_cursor(&mut self) {
-        if self.terminal.cursor_kind() == CursorKind::Hidden {
-            self.terminal
-                .backend_mut()
-                .show_cursor(CursorKind::Block)
-                .ok();
-        }
-    }
-
-    pub fn load_cursor(&mut self) {
-        if self.terminal.cursor_kind() == CursorKind::Hidden {
-            self.terminal.backend_mut().hide_cursor().ok();
-        }
+    pub fn resize(&mut self, area: Rect) {
+        self.area = area;
     }
 
     pub fn push(&mut self, mut layer: Box<dyn Component>) {
@@ -126,50 +104,68 @@ impl Compositor {
         self.layers.push(layer);
     }
 
+    /// Replace a component that has the given `id` with the new layer and if
+    /// no component is found, push the layer normally.
+    pub fn replace_or_push<T: Component>(&mut self, id: &'static str, layer: T) {
+        if let Some(component) = self.find_id(id) {
+            *component = layer;
+        } else {
+            self.push(Box::new(layer))
+        }
+    }
+
     pub fn pop(&mut self) -> Option<Box<dyn Component>> {
         self.layers.pop()
     }
 
-    pub fn handle_event(&mut self, event: Event, cx: &mut Context) -> bool {
+    pub fn remove(&mut self, id: &'static str) -> Option<Box<dyn Component>> {
+        let idx = self
+            .layers
+            .iter()
+            .position(|layer| layer.id() == Some(id))?;
+        Some(self.layers.remove(idx))
+    }
+
+    pub fn handle_event(&mut self, event: &Event, cx: &mut Context) -> bool {
         // If it is a key event and a macro is being recorded, push the key event to the recording.
         if let (Event::Key(key), Some((_, keys))) = (event, &mut cx.editor.macro_recording) {
-            keys.push(key.into());
+            keys.push(*key);
         }
+
+        let mut callbacks = Vec::new();
+        let mut consumed = false;
 
         // propagate events through the layers until we either find a layer that consumes it or we
         // run out of layers (event bubbling)
         for layer in self.layers.iter_mut().rev() {
             match layer.handle_event(event, cx) {
                 EventResult::Consumed(Some(callback)) => {
-                    callback(self, cx);
-                    return true;
+                    callbacks.push(callback);
+                    consumed = true;
+                    break;
                 }
-                EventResult::Consumed(None) => return true,
-                EventResult::Ignored => false,
+                EventResult::Consumed(None) => {
+                    consumed = true;
+                    break;
+                }
+                EventResult::Ignored(Some(callback)) => {
+                    callbacks.push(callback);
+                }
+                EventResult::Ignored(None) => {}
             };
         }
-        false
+
+        for callback in callbacks {
+            callback(self, cx)
+        }
+
+        consumed
     }
 
-    pub fn render(&mut self, cx: &mut Context) {
-        self.terminal
-            .autoresize()
-            .expect("Unable to determine terminal size");
-
-        // TODO: need to recalculate view tree if necessary
-
-        let surface = self.terminal.current_buffer_mut();
-
-        let area = *surface.area();
-
+    pub fn render(&mut self, area: Rect, surface: &mut Surface, cx: &mut Context) {
         for layer in &mut self.layers {
             layer.render(area, surface, cx);
         }
-
-        let (pos, kind) = self.cursor(area, cx.editor);
-        let pos = pos.map(|pos| (pos.col as u16, pos.row as u16));
-
-        self.terminal.draw(pos, kind).unwrap();
     }
 
     pub fn cursor(&self, area: Rect, editor: &Editor) -> (Option<Position>, CursorKind) {
@@ -196,10 +192,9 @@ impl Compositor {
     }
 
     pub fn find_id<T: 'static>(&mut self, id: &'static str) -> Option<&mut T> {
-        let type_name = std::any::type_name::<T>();
         self.layers
             .iter_mut()
-            .find(|component| component.type_name() == type_name && component.id() == Some(id))
+            .find(|component| component.id() == Some(id))
             .and_then(|component| component.as_any_mut().downcast_mut())
     }
 }

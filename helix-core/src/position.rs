@@ -1,8 +1,9 @@
+use std::borrow::Cow;
+
 use crate::{
     chars::char_is_line_ending,
-    graphemes::{ensure_grapheme_boundary_prev, RopeGraphemes},
+    graphemes::{ensure_grapheme_boundary_prev, grapheme_width, RopeGraphemes},
     line_ending::line_end_char_index,
-    unicode::width::UnicodeWidthChar,
     RopeSlice,
 };
 
@@ -77,14 +78,17 @@ pub fn visual_coords_at_pos(text: RopeSlice, pos: usize, tab_width: usize) -> Po
 
     let line_start = text.line_to_char(line);
     let pos = ensure_grapheme_boundary_prev(text, pos);
-    let col = text
-        .slice(line_start..pos)
-        .chars()
-        .flat_map(|c| match c {
-            '\t' => Some(tab_width),
-            c => UnicodeWidthChar::width(c),
-        })
-        .sum();
+
+    let mut col = 0;
+
+    for grapheme in RopeGraphemes::new(text.slice(line_start..pos)) {
+        if grapheme == "\t" {
+            col += tab_width - (col % tab_width);
+        } else {
+            let grapheme = Cow::from(grapheme);
+            col += grapheme_width(&grapheme);
+        }
+    }
 
     Position::new(line, col)
 }
@@ -105,11 +109,11 @@ pub fn visual_coords_at_pos(text: RopeSlice, pos: usize, tab_width: usize) -> Po
 /// with left-side block-cursor positions, as this prevents the the block cursor
 /// from jumping to the next line.  Otherwise you typically want it to be `false`,
 /// such as when dealing with raw anchor/head positions.
-///
-/// TODO: this should be changed to work in terms of visual row/column, not
-/// graphemes.
 pub fn pos_at_coords(text: RopeSlice, coords: Position, limit_before_line_ending: bool) -> usize {
-    let Position { row, col } = coords;
+    let Position { mut row, col } = coords;
+    if limit_before_line_ending {
+        row = row.min(text.len_lines() - 1);
+    };
     let line_start = text.line_to_char(row);
     let line_end = if limit_before_line_ending {
         line_end_char_index(&text, row)
@@ -123,6 +127,43 @@ pub fn pos_at_coords(text: RopeSlice, coords: Position, limit_before_line_ending
             break;
         }
         col_char_offset += g.chars().count();
+    }
+
+    line_start + col_char_offset
+}
+
+/// Convert visual (line, column) coordinates to a character index.
+///
+/// If the `line` coordinate is beyond the end of the file, the EOF
+/// position will be returned.
+///
+/// If the `column` coordinate is past the end of the given line, the
+/// line-end position (in this case, just before the line ending
+/// character) will be returned.
+pub fn pos_at_visual_coords(text: RopeSlice, coords: Position, tab_width: usize) -> usize {
+    let Position { mut row, col } = coords;
+    row = row.min(text.len_lines() - 1);
+    let line_start = text.line_to_char(row);
+    let line_end = line_end_char_index(&text, row);
+
+    let mut col_char_offset = 0;
+    let mut cols_remaining = col;
+    for grapheme in RopeGraphemes::new(text.slice(line_start..line_end)) {
+        let grapheme_width = if grapheme == "\t" {
+            tab_width - ((col - cols_remaining) % tab_width)
+        } else {
+            let grapheme = Cow::from(grapheme);
+            grapheme_width(&grapheme)
+        };
+
+        // If pos is in the middle of a wider grapheme (tab for example)
+        // return the starting offset.
+        if grapheme_width > cols_remaining {
+            break;
+        }
+
+        cols_remaining -= grapheme_width;
+        col_char_offset += grapheme.chars().count();
     }
 
     line_start + col_char_offset
@@ -290,5 +331,78 @@ mod test {
         assert_eq!(pos_at_coords(slice, (0, 0).into(), false), 0);
         assert_eq!(pos_at_coords(slice, (0, 1).into(), false), 1);
         assert_eq!(pos_at_coords(slice, (0, 2).into(), false), 2);
+
+        // Test out of bounds.
+        let text = Rope::new();
+        let slice = text.slice(..);
+        assert_eq!(pos_at_coords(slice, (10, 0).into(), true), 0);
+        assert_eq!(pos_at_coords(slice, (0, 10).into(), true), 0);
+        assert_eq!(pos_at_coords(slice, (10, 10).into(), true), 0);
+    }
+
+    #[test]
+    fn test_pos_at_visual_coords() {
+        let text = Rope::from("ḧëḷḷö\nẅöṛḷḋ");
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (0, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 5).into(), 4), 5); // position on \n
+        assert_eq!(pos_at_visual_coords(slice, (0, 6).into(), 4), 5); // position after \n
+        assert_eq!(pos_at_visual_coords(slice, (1, 0).into(), 4), 6); // position on w
+        assert_eq!(pos_at_visual_coords(slice, (1, 1).into(), 4), 7); // position on o
+        assert_eq!(pos_at_visual_coords(slice, (1, 4).into(), 4), 10); // position on d
+
+        // Test with wide characters.
+        let text = Rope::from("今日はいい\n");
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (0, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 1).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 2).into(), 4), 1);
+        assert_eq!(pos_at_visual_coords(slice, (0, 3).into(), 4), 1);
+        assert_eq!(pos_at_visual_coords(slice, (0, 4).into(), 4), 2);
+        assert_eq!(pos_at_visual_coords(slice, (0, 5).into(), 4), 2);
+        assert_eq!(pos_at_visual_coords(slice, (0, 6).into(), 4), 3);
+        assert_eq!(pos_at_visual_coords(slice, (0, 7).into(), 4), 3);
+        assert_eq!(pos_at_visual_coords(slice, (0, 8).into(), 4), 4);
+        assert_eq!(pos_at_visual_coords(slice, (0, 9).into(), 4), 4);
+        // assert_eq!(pos_at_visual_coords(slice, (0, 10).into(), 4, false), 5);
+        // assert_eq!(pos_at_visual_coords(slice, (0, 10).into(), 4, true), 5);
+        assert_eq!(pos_at_visual_coords(slice, (1, 0).into(), 4), 6);
+
+        // Test with grapheme clusters.
+        let text = Rope::from("a̐éö̲\r\n");
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (0, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 1).into(), 4), 2);
+        assert_eq!(pos_at_visual_coords(slice, (0, 2).into(), 4), 4);
+        assert_eq!(pos_at_visual_coords(slice, (0, 3).into(), 4), 7); // \r\n is one char here
+        assert_eq!(pos_at_visual_coords(slice, (0, 4).into(), 4), 7);
+        assert_eq!(pos_at_visual_coords(slice, (1, 0).into(), 4), 9);
+
+        // Test with wide-character grapheme clusters.
+        let text = Rope::from("किमपि");
+        // 2 - 1 - 2 codepoints
+        // TODO: delete handling as per https://news.ycombinator.com/item?id=20058454
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (0, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 1).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 2).into(), 4), 2);
+        assert_eq!(pos_at_visual_coords(slice, (0, 3).into(), 4), 3);
+
+        // Test with tabs.
+        let text = Rope::from("\tHello\n");
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (0, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 1).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 2).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 3).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 4).into(), 4), 1);
+        assert_eq!(pos_at_visual_coords(slice, (0, 5).into(), 4), 2);
+
+        // Test out of bounds.
+        let text = Rope::new();
+        let slice = text.slice(..);
+        assert_eq!(pos_at_visual_coords(slice, (10, 0).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (0, 10).into(), 4), 0);
+        assert_eq!(pos_at_visual_coords(slice, (10, 10).into(), 4), 0);
     }
 }

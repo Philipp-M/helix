@@ -21,7 +21,6 @@ pub enum Assoc {
     After,
 }
 
-// ChangeSpec = Change | ChangeSet | Vec<Change>
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ChangeSet {
     pub(crate) changes: Vec<Operation>,
@@ -50,7 +49,6 @@ impl ChangeSet {
     }
 
     // TODO: from iter
-    //
 
     #[doc(hidden)] // used by lsp to convert to LSP changes
     pub fn changes(&self) -> &[Operation] {
@@ -85,7 +83,7 @@ impl ChangeSet {
 
         let new_last = match self.changes.as_mut_slice() {
             [.., Insert(prev)] | [.., Insert(prev), Delete(_)] => {
-                prev.push_tendril(&fragment);
+                prev.push_str(&fragment);
                 return;
             }
             [.., last @ Delete(_)] => std::mem::replace(last, Insert(fragment)),
@@ -189,7 +187,7 @@ impl ChangeSet {
                             // TODO: cover this with a test
                             // figure out the byte index of the truncated string end
                             let (pos, _) = s.char_indices().nth(j).unwrap();
-                            s.pop_front(pos as u32);
+                            s.replace_range(0..pos, "");
                             head_a = Some(Insert(s));
                             head_b = changes_b.next();
                         }
@@ -211,9 +209,11 @@ impl ChangeSet {
                         Ordering::Greater => {
                             // figure out the byte index of the truncated string end
                             let (pos, _) = s.char_indices().nth(j).unwrap();
-                            let pos = pos as u32;
-                            changes.insert(s.subtendril(0, pos));
-                            head_a = Some(Insert(s.subtendril(pos, s.len() as u32 - pos)));
+                            let mut before = s;
+                            let after = before.split_off(pos);
+
+                            changes.insert(before);
+                            head_a = Some(Insert(after));
                             head_b = changes_b.next();
                         }
                     }
@@ -277,7 +277,7 @@ impl ChangeSet {
                 }
                 Delete(n) => {
                     let text = Cow::from(original_doc.slice(pos..pos + *n));
-                    changes.insert(Tendril::from_slice(&text));
+                    changes.insert(Tendril::from(text.as_ref()));
                     pos += n;
                 }
                 Insert(s) => {
@@ -413,8 +413,6 @@ impl ChangeSet {
 pub struct Transaction {
     changes: ChangeSet,
     selection: Option<Selection>,
-    // effects, annotations
-    // scroll_into_view
 }
 
 impl Transaction {
@@ -438,14 +436,12 @@ impl Transaction {
 
     /// Returns true if applied successfully.
     pub fn apply(&self, doc: &mut Rope) -> bool {
-        if !self.changes.is_empty() {
-            // apply changes to the document
-            if !self.changes.apply(doc) {
-                return false;
-            }
+        if self.changes.is_empty() {
+            return true;
         }
 
-        true
+        // apply changes to the document
+        self.changes.apply(doc)
     }
 
     /// Generate a transaction that reverts this one.
@@ -473,7 +469,7 @@ impl Transaction {
     /// Generate a transaction from a set of changes.
     pub fn change<I>(doc: &Rope, changes: I) -> Self
     where
-        I: IntoIterator<Item = Change> + Iterator,
+        I: Iterator<Item = Change>,
     {
         let len = doc.len_chars();
 
@@ -481,12 +477,11 @@ impl Transaction {
         let size = upper.unwrap_or(lower);
         let mut changeset = ChangeSet::with_capacity(2 * size + 1); // rough estimate
 
-        // TODO: verify ranges are ordered and not overlapping or change will panic.
-
-        // TODO: test for (pos, pos, None) to factor out as nothing
-
         let mut last = 0;
         for (from, to, tendril) in changes {
+            // Verify ranges are ordered and not overlapping
+            debug_assert!(last <= from);
+
             // Retain from last "to" to current "from"
             changeset.retain(from - last);
             let span = to - from;
@@ -582,7 +577,7 @@ impl<'a> Iterator for ChangeIterator<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::State;
+    use crate::history::State;
 
     #[test]
     fn composition() {
@@ -692,7 +687,7 @@ mod test {
         let mut doc = Rope::from("hello world!\ntest 123");
         let transaction = Transaction::change(
             &doc,
-            // (1, 1, None) is a useless 0-width delete
+            // (1, 1, None) is a useless 0-width delete that gets factored out
             vec![(1, 1, None), (6, 11, Some("void".into())), (12, 17, None)].into_iter(),
         );
         transaction.apply(&mut doc);
@@ -709,20 +704,23 @@ mod test {
 
     #[test]
     fn optimized_composition() {
-        let mut state = State::new("".into());
-        let t1 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('h'));
+        let mut state = State {
+            doc: "".into(),
+            selection: Selection::point(0),
+        };
+        let t1 = Transaction::insert(&state.doc, &state.selection, Tendril::from("h"));
         t1.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t1.changes());
-        let t2 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('e'));
+        let t2 = Transaction::insert(&state.doc, &state.selection, Tendril::from("e"));
         t2.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t2.changes());
-        let t3 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('l'));
+        let t3 = Transaction::insert(&state.doc, &state.selection, Tendril::from("l"));
         t3.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t3.changes());
-        let t4 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('l'));
+        let t4 = Transaction::insert(&state.doc, &state.selection, Tendril::from("l"));
         t4.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t4.changes());
-        let t5 = Transaction::insert(&state.doc, &state.selection, Tendril::from_char('o'));
+        let t5 = Transaction::insert(&state.doc, &state.selection, Tendril::from("o"));
         t5.apply(&mut state.doc);
         state.selection = state.selection.clone().map(t5.changes());
 
@@ -761,7 +759,7 @@ mod test {
 
     #[test]
     fn combine_with_utf8() {
-        const TEST_CASE: &'static str = "Hello, これはヘリックスエディターです！";
+        const TEST_CASE: &str = "Hello, これはヘリックスエディターです！";
 
         let empty = Rope::from("");
         let a = ChangeSet::new(&empty);

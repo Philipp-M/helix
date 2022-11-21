@@ -1,36 +1,53 @@
-[
-  (atx_heading)
-  (setext_heading)
-] @markup.heading
 
-(code_fence_content) @none
+(setext_heading (paragraph) @markup.heading.1 (setext_h1_underline) @markup.heading.marker)
+(setext_heading (paragraph) @markup.heading.2 (setext_h2_underline) @markup.heading.marker)
+
+(atx_heading (atx_h1_marker) @markup.heading.marker (inline) @markup.heading.1)
+(atx_heading (atx_h2_marker) @markup.heading.marker (inline) @markup.heading.2)
+(atx_heading (atx_h3_marker) @markup.heading.marker (inline) @markup.heading.3)
+(atx_heading (atx_h4_marker) @markup.heading.marker (inline) @markup.heading.4)
+(atx_heading (atx_h5_marker) @markup.heading.marker (inline) @markup.heading.5)
+(atx_heading (atx_h6_marker) @markup.heading.marker (inline) @markup.heading.6)
 
 [
   (indented_code_block)
   (fenced_code_block)
 ] @markup.raw.block
 
-(block_quote) @markup.quote
+(info_string) @label
 
-(code_span) @markup.raw.inline
+[
+  (fenced_code_block_delimiter)
+] @punctuation.bracket
 
-(emphasis) @markup.italic
+[
+  (link_destination)
+] @markup.link.url
 
-(strong_emphasis) @markup.bold
-
-(link_destination) @markup.link.url
-(link_label) @markup.link.label
+[
+  (link_label)
+] @markup.link.label
 
 [
   (list_marker_plus)
   (list_marker_minus)
   (list_marker_star)
+] @markup.list.unnumbered
+
+[
   (list_marker_dot)
   (list_marker_parenthesis)
+] @markup.list.numbered
+
+(thematic_break) @punctuation.delimiter
+
+[
+  (block_continuation)
+  (block_quote_marker)
 ] @punctuation.special
 
 [
   (backslash_escape)
-  (hard_line_break)
-] @string.character.escape
+] @string.escape
 
+(block_quote) @markup.quote

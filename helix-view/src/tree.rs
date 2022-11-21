@@ -45,8 +45,6 @@ impl Node {
     }
 }
 
-// TODO: screen coord to container + container coordinate helpers
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layout {
     Horizontal,
@@ -221,7 +219,7 @@ impl Tree {
 
         if self.focus == index {
             // focus on something else
-            self.focus_next();
+            self.focus = self.prev();
         }
 
         stack.push(index);
@@ -235,7 +233,6 @@ impl Tree {
             {
                 if let Some(pos) = container.children.iter().position(|&child| child == index) {
                     container.children.remove(pos);
-
                     // TODO: if container now only has one child, remove it and place child in parent
                     if container.children.is_empty() && parent_id != self.root {
                         // if container now empty, remove it
@@ -273,16 +270,32 @@ impl Tree {
             })
     }
 
+    /// Get reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
     pub fn get(&self, index: ViewId) -> &View {
+        self.try_get(index).unwrap()
+    }
+
+    /// Try to get reference to a [View] by index. Returns `None` if node content is not a [Content::View]
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes. This can be checked with [Self::contains]
+    pub fn try_get(&self, index: ViewId) -> Option<&View> {
         match &self.nodes[index] {
             Node {
                 content: Content::View(view),
                 ..
-            } => view,
-            _ => unreachable!(),
+            } => Some(view),
+            _ => None,
         }
     }
 
+    /// Get a mutable reference to a [View] by index.
+    /// # Panics
+    ///
+    /// Panics if `index` is not in self.nodes, or if the node's content is not [Content::View]. This can be checked with [Self::contains].
     pub fn get_mut(&mut self, index: ViewId) -> &mut View {
         match &mut self.nodes[index] {
             Node {
@@ -291,6 +304,11 @@ impl Tree {
             } => view,
             _ => unreachable!(),
         }
+    }
+
+    /// Check if tree contains a [Node] with a given index.
+    pub fn contains(&self, index: ViewId) -> bool {
+        self.nodes.contains_key(index)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -481,7 +499,7 @@ impl Tree {
                     // in a vertical container (and already correct based on previous search)
                     child_id = *container.children.iter().min_by_key(|id| {
                         let x = match &self.nodes[**id].content {
-                            Content::View(view) => view.inner_area().left(),
+                            Content::View(view) => view.area.left(),
                             Content::Container(container) => container.area.left(),
                         };
                         (current_x as i16 - x as i16).abs()
@@ -492,7 +510,7 @@ impl Tree {
                     // in a horizontal container (and already correct based on previous search)
                     child_id = *container.children.iter().min_by_key(|id| {
                         let y = match &self.nodes[**id].content {
-                            Content::View(view) => view.inner_area().top(),
+                            Content::View(view) => view.area.top(),
                             Content::Container(container) => container.area.top(),
                         };
                         (current_y as i16 - y as i16).abs()
@@ -503,49 +521,124 @@ impl Tree {
         Some(child_id)
     }
 
-    pub fn focus_direction(&mut self, direction: Direction) {
-        if let Some(id) = self.find_split_in_direction(self.focus, direction) {
-            self.focus = id;
+    pub fn prev(&self) -> ViewId {
+        // This function is very dumb, but that's because we don't store any parent links.
+        // (we'd be able to go parent.prev_sibling() recursively until we find something)
+        // For now that's okay though, since it's unlikely you'll be able to open a large enough
+        // number of splits to notice.
+
+        let mut views = self
+            .traverse()
+            .rev()
+            .skip_while(|&(id, _view)| id != self.focus)
+            .skip(1); // Skip focused value
+        if let Some((id, _)) = views.next() {
+            id
+        } else {
+            // extremely crude, take the last item
+            let (key, _) = self.traverse().rev().next().unwrap();
+            key
         }
     }
 
-    pub fn focus_next(&mut self) {
+    pub fn next(&self) -> ViewId {
         // This function is very dumb, but that's because we don't store any parent links.
         // (we'd be able to go parent.next_sibling() recursively until we find something)
         // For now that's okay though, since it's unlikely you'll be able to open a large enough
         // number of splits to notice.
-
-        // current = focus
-        // let found = loop do {
-        //   node = focus.parent;
-        //   let found = node.next_sibling_of(current)
-        //   if some {
-        //       break found;
-        //   }
-        //   // else
-        //   if node == root {
-        //       return first child of root;
-        //   };
-        //   current = parent;
-        //  }
-        // }
-        //
-        // use found next sibling
-        // loop do {
-        //   if found = view -> focus = found, return
-        //   if found = container -> found = first child
-        // }
 
         let mut views = self
             .traverse()
             .skip_while(|&(id, _view)| id != self.focus)
             .skip(1); // Skip focused value
         if let Some((id, _)) = views.next() {
-            self.focus = id;
+            id
         } else {
             // extremely crude, take the first item again
             let (key, _) = self.traverse().next().unwrap();
-            self.focus = key;
+            key
+        }
+    }
+
+    pub fn transpose(&mut self) {
+        let focus = self.focus;
+        let parent = self.nodes[focus].parent;
+        if let Content::Container(container) = &mut self.nodes[parent].content {
+            container.layout = match container.layout {
+                Layout::Vertical => Layout::Horizontal,
+                Layout::Horizontal => Layout::Vertical,
+            };
+            self.recalculate();
+        }
+    }
+
+    pub fn swap_split_in_direction(&mut self, direction: Direction) -> Option<()> {
+        let focus = self.focus;
+        let target = self.find_split_in_direction(focus, direction)?;
+        let focus_parent = self.nodes[focus].parent;
+        let target_parent = self.nodes[target].parent;
+
+        if focus_parent == target_parent {
+            let parent = focus_parent;
+            let [parent, focus, target] = self.nodes.get_disjoint_mut([parent, focus, target])?;
+            match (&mut parent.content, &mut focus.content, &mut target.content) {
+                (
+                    Content::Container(parent),
+                    Content::View(focus_view),
+                    Content::View(target_view),
+                ) => {
+                    let focus_pos = parent.children.iter().position(|id| focus_view.id == *id)?;
+                    let target_pos = parent
+                        .children
+                        .iter()
+                        .position(|id| target_view.id == *id)?;
+                    // swap node positions so that traversal order is kept
+                    parent.children[focus_pos] = target_view.id;
+                    parent.children[target_pos] = focus_view.id;
+                    // swap area so that views rendered at the correct location
+                    std::mem::swap(&mut focus_view.area, &mut target_view.area);
+
+                    Some(())
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            let [focus_parent, target_parent, focus, target] =
+                self.nodes
+                    .get_disjoint_mut([focus_parent, target_parent, focus, target])?;
+            match (
+                &mut focus_parent.content,
+                &mut target_parent.content,
+                &mut focus.content,
+                &mut target.content,
+            ) {
+                (
+                    Content::Container(focus_parent),
+                    Content::Container(target_parent),
+                    Content::View(focus_view),
+                    Content::View(target_view),
+                ) => {
+                    let focus_pos = focus_parent
+                        .children
+                        .iter()
+                        .position(|id| focus_view.id == *id)?;
+                    let target_pos = target_parent
+                        .children
+                        .iter()
+                        .position(|id| target_view.id == *id)?;
+                    // re-parent target and focus nodes
+                    std::mem::swap(
+                        &mut focus_parent.children[focus_pos],
+                        &mut target_parent.children[target_pos],
+                    );
+                    std::mem::swap(&mut focus.parent, &mut target.parent);
+                    // swap area so that views rendered at the correct location
+                    std::mem::swap(&mut focus_view.area, &mut target_view.area);
+
+                    Some(())
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -588,9 +681,27 @@ impl<'a> Iterator for Traverse<'a> {
     }
 }
 
+impl<'a> DoubleEndedIterator for Traverse<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        loop {
+            let key = self.stack.pop()?;
+
+            let node = &self.tree.nodes[key];
+
+            match &node.content {
+                Content::View(view) => return Some((key, view)),
+                Content::Container(container) => {
+                    self.stack.extend(container.children.iter());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::editor::GutterType;
     use crate::DocumentId;
 
     #[test]
@@ -601,22 +712,34 @@ mod test {
             width: 180,
             height: 80,
         });
-        let mut view = View::new(DocumentId::default());
+        let mut view = View::new(
+            DocumentId::default(),
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
         view.area = Rect::new(0, 0, 180, 80);
         tree.insert(view);
 
         let l0 = tree.focus;
-        let view = View::new(DocumentId::default());
+        let view = View::new(
+            DocumentId::default(),
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
         tree.split(view, Layout::Vertical);
         let r0 = tree.focus;
 
         tree.focus = l0;
-        let view = View::new(DocumentId::default());
+        let view = View::new(
+            DocumentId::default(),
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
         tree.split(view, Layout::Horizontal);
         let l1 = tree.focus;
 
         tree.focus = l0;
-        let view = View::new(DocumentId::default());
+        let view = View::new(
+            DocumentId::default(),
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
         tree.split(view, Layout::Vertical);
         let l2 = tree.focus;
 
@@ -646,5 +769,134 @@ mod test {
         assert_eq!(None, tree.find_split_in_direction(r0, Direction::Down));
         assert_eq!(None, tree.find_split_in_direction(r0, Direction::Right));
         assert_eq!(None, tree.find_split_in_direction(r0, Direction::Up));
+    }
+
+    #[test]
+    fn swap_split_in_direction() {
+        let mut tree = Tree::new(Rect {
+            x: 0,
+            y: 0,
+            width: 180,
+            height: 80,
+        });
+
+        let doc_l0 = DocumentId::default();
+        let mut view = View::new(
+            doc_l0,
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
+        view.area = Rect::new(0, 0, 180, 80);
+        tree.insert(view);
+
+        let l0 = tree.focus;
+
+        let doc_r0 = DocumentId::default();
+        let view = View::new(
+            doc_r0,
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
+        tree.split(view, Layout::Vertical);
+        let r0 = tree.focus;
+
+        tree.focus = l0;
+
+        let doc_l1 = DocumentId::default();
+        let view = View::new(
+            doc_l1,
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
+        tree.split(view, Layout::Horizontal);
+        let l1 = tree.focus;
+
+        tree.focus = l0;
+
+        let doc_l2 = DocumentId::default();
+        let view = View::new(
+            doc_l2,
+            vec![GutterType::Diagnostics, GutterType::LineNumbers],
+        );
+        tree.split(view, Layout::Vertical);
+        let l2 = tree.focus;
+
+        // Views in test
+        // | L0  | L2 |    |
+        // |    L1    | R0 |
+
+        // Document IDs in test
+        // | l0  | l2 |    |
+        // |    l1    | r0 |
+
+        fn doc_id(tree: &Tree, view_id: ViewId) -> Option<DocumentId> {
+            if let Content::View(view) = &tree.nodes[view_id].content {
+                Some(view.doc)
+            } else {
+                None
+            }
+        }
+
+        tree.focus = l0;
+        // `*` marks the view in focus from view table (here L0)
+        // | l0*  | l2 |    |
+        // |    l1     | r0 |
+        tree.swap_split_in_direction(Direction::Down);
+        // | l1   | l2 |    |
+        // |    l0*    | r0 |
+        assert_eq!(tree.focus, l0);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l1), Some(doc_l0));
+        assert_eq!(doc_id(&tree, l2), Some(doc_l2));
+        assert_eq!(doc_id(&tree, r0), Some(doc_r0));
+
+        tree.swap_split_in_direction(Direction::Right);
+
+        // | l1  | l2 |     |
+        // |    r0    | l0* |
+        assert_eq!(tree.focus, l0);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l1), Some(doc_r0));
+        assert_eq!(doc_id(&tree, l2), Some(doc_l2));
+        assert_eq!(doc_id(&tree, r0), Some(doc_l0));
+
+        // cannot swap, nothing changes
+        tree.swap_split_in_direction(Direction::Up);
+        // | l1  | l2 |     |
+        // |    r0    | l0* |
+        assert_eq!(tree.focus, l0);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l1), Some(doc_r0));
+        assert_eq!(doc_id(&tree, l2), Some(doc_l2));
+        assert_eq!(doc_id(&tree, r0), Some(doc_l0));
+
+        // cannot swap, nothing changes
+        tree.swap_split_in_direction(Direction::Down);
+        // | l1  | l2 |     |
+        // |    r0    | l0* |
+        assert_eq!(tree.focus, l0);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l1), Some(doc_r0));
+        assert_eq!(doc_id(&tree, l2), Some(doc_l2));
+        assert_eq!(doc_id(&tree, r0), Some(doc_l0));
+
+        tree.focus = l2;
+        // | l1  | l2* |    |
+        // |    r0     | l0 |
+
+        tree.swap_split_in_direction(Direction::Down);
+        // | l1  | r0  |    |
+        // |    l2*    | l0 |
+        assert_eq!(tree.focus, l2);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l1), Some(doc_l2));
+        assert_eq!(doc_id(&tree, l2), Some(doc_r0));
+        assert_eq!(doc_id(&tree, r0), Some(doc_l0));
+
+        tree.swap_split_in_direction(Direction::Up);
+        // | l2* | r0 |    |
+        // |    l1    | l0 |
+        assert_eq!(tree.focus, l2);
+        assert_eq!(doc_id(&tree, l0), Some(doc_l2));
+        assert_eq!(doc_id(&tree, l1), Some(doc_l1));
+        assert_eq!(doc_id(&tree, l2), Some(doc_r0));
+        assert_eq!(doc_id(&tree, r0), Some(doc_l0));
     }
 }

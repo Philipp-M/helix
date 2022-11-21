@@ -1,8 +1,8 @@
 use anyhow::{Context, Error, Result};
+use crossterm::event::EventStream;
 use helix_term::application::Application;
 use helix_term::args::Args;
 use helix_term::config::Config;
-use helix_term::keymap::merge_keys;
 use std::path::PathBuf;
 
 fn setup_logging(logpath: PathBuf, verbosity: u64) -> Result<()> {
@@ -40,12 +40,12 @@ fn main() -> Result<()> {
 
 #[tokio::main]
 async fn main_impl() -> Result<i32> {
-    let cache_dir = helix_core::cache_dir();
-    if !cache_dir.exists() {
-        std::fs::create_dir_all(&cache_dir).ok();
+    let logpath = helix_loader::log_file();
+    let parent = logpath.parent().unwrap();
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).ok();
     }
 
-    let logpath = cache_dir.join("helix.log");
     let help = format!(
         "\
 {} {}
@@ -56,14 +56,22 @@ USAGE:
     hx [FLAGS] [files]...
 
 ARGS:
-    <files>...    Sets the input file to use
+    <files>...    Sets the input file to use, position can also be specified via file[:row[:col]]
 
 FLAGS:
-    -h, --help       Prints help information
-    --tutor          Loads the tutorial
-    -v               Increases logging verbosity each use for up to 3 times
-                     (default file: {})
-    -V, --version    Prints version information
+    -h, --help                     Prints help information
+    --tutor                        Loads the tutorial
+    --health [CATEGORY]            Checks for potential errors in editor setup
+                                   CATEGORY can be a language or one of 'clipboard', 'languages'
+                                   or 'all'. 'all' is the default if not specified.
+    -g, --grammar {{fetch|build}}    Fetches or builds tree-sitter grammars listed in languages.toml
+    -c, --config <file>            Specifies a file to use for configuration
+    -v                             Increases logging verbosity each use for up to 3 times
+    --log                          Specifies a file to use for logging
+                                   (default file: {})
+    -V, --version                  Prints version information
+    --vsplit                       Splits all given files vertically into different windows
+    --hsplit                       Splits all given files horizontally into different windows
 ",
         env!("CARGO_PKG_NAME"),
         env!("VERSION_AND_GIT_HASH"),
@@ -85,19 +93,45 @@ FLAGS:
         std::process::exit(0);
     }
 
-    let conf_dir = helix_core::config_dir();
-    if !conf_dir.exists() {
-        std::fs::create_dir_all(&conf_dir).ok();
+    if args.health {
+        if let Err(err) = helix_term::health::print_health(args.health_arg) {
+            // Piping to for example `head -10` requires special handling:
+            // https://stackoverflow.com/a/65760807/7115678
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err.into());
+            }
+        }
+
+        std::process::exit(0);
     }
 
-    let config = match std::fs::read_to_string(conf_dir.join("config.toml")) {
+    if args.fetch_grammars {
+        helix_loader::grammar::fetch_grammars()?;
+        return Ok(0);
+    }
+
+    if args.build_grammars {
+        helix_loader::grammar::build_grammars(None)?;
+        return Ok(0);
+    }
+
+    let logpath = args.log_file.as_ref().cloned().unwrap_or(logpath);
+    setup_logging(logpath, args.verbosity).context("failed to initialize logging")?;
+
+    let config_dir = helix_loader::config_dir();
+    if !config_dir.exists() {
+        std::fs::create_dir_all(&config_dir).ok();
+    }
+
+    helix_loader::initialize_config_file(args.config_file.clone());
+
+    let config = match std::fs::read_to_string(helix_loader::config_file()) {
         Ok(config) => toml::from_str(&config)
-            .map(merge_keys)
+            .map(helix_term::keymap::merge_keys)
             .unwrap_or_else(|err| {
                 eprintln!("Bad config: {}", err);
                 eprintln!("Press <ENTER> to continue with default config");
                 use std::io::Read;
-                // This waits for an enter press.
                 let _ = std::io::stdin().read(&mut []);
                 Config::default()
             }),
@@ -105,12 +139,20 @@ FLAGS:
         Err(err) => return Err(Error::new(err)),
     };
 
-    setup_logging(logpath, args.verbosity).context("failed to initialize logging")?;
+    let syn_loader_conf = helix_core::config::user_syntax_loader().unwrap_or_else(|err| {
+        eprintln!("Bad language config: {}", err);
+        eprintln!("Press <ENTER> to continue with default language config");
+        use std::io::Read;
+        // This waits for an enter press.
+        let _ = std::io::stdin().read(&mut []);
+        helix_core::config::default_syntax_loader()
+    });
 
     // TODO: use the thread local executor to spawn the application task separately from the work pool
-    let mut app = Application::new(args, config).context("unable to create new application")?;
+    let mut app = Application::new(args, config, syn_loader_conf)
+        .context("unable to create new application")?;
 
-    let exit_code = app.run().await?;
+    let exit_code = app.run(&mut EventStream::new()).await?;
 
     Ok(exit_code)
 }

@@ -1,11 +1,16 @@
-use crate::compositor::{Component, Context, EventResult};
-use crossterm::event::{Event, KeyCode, KeyEvent};
+use crate::compositor::{Component, Context, Event, EventResult};
+use helix_view::{apply_transaction, editor::CompleteAction};
 use tui::buffer::Buffer as Surface;
+use tui::text::Spans;
 
 use std::borrow::Cow;
 
-use helix_core::Transaction;
-use helix_view::{graphics::Rect, Document, Editor};
+use helix_core::{Change, Transaction};
+use helix_view::{
+    graphics::Rect,
+    input::{KeyCode, KeyEvent},
+    Document, Editor,
+};
 
 use crate::commands;
 use crate::ui::{menu, Markdown, Menu, Popup, PromptEvent};
@@ -14,19 +19,25 @@ use helix_lsp::{lsp, util};
 use lsp::CompletionItem;
 
 impl menu::Item for CompletionItem {
-    fn sort_text(&self) -> &str {
-        self.filter_text.as_ref().unwrap_or(&self.label).as_str()
+    type Data = ();
+    fn sort_text(&self, data: &Self::Data) -> Cow<str> {
+        self.filter_text(data)
     }
 
-    fn filter_text(&self) -> &str {
-        self.filter_text.as_ref().unwrap_or(&self.label).as_str()
+    #[inline]
+    fn filter_text(&self, _data: &Self::Data) -> Cow<str> {
+        self.filter_text
+            .as_ref()
+            .unwrap_or(&self.label)
+            .as_str()
+            .into()
     }
 
-    fn label(&self) -> &str {
-        self.label.as_str()
+    fn label(&self, _data: &Self::Data) -> Spans {
+        self.label.as_str().into()
     }
 
-    fn row(&self) -> menu::Row {
+    fn row(&self, _data: &Self::Data) -> menu::Row {
         menu::Row::new(vec![
             menu::Cell::from(self.label.as_str()),
             menu::Cell::from(match self.kind {
@@ -55,7 +66,10 @@ impl menu::Item for CompletionItem {
                 Some(lsp::CompletionItemKind::EVENT) => "event",
                 Some(lsp::CompletionItemKind::OPERATOR) => "operator",
                 Some(lsp::CompletionItemKind::TYPE_PARAMETER) => "type_param",
-                Some(kind) => unimplemented!("{:?}", kind),
+                Some(kind) => {
+                    log::error!("Received unknown completion item kind: {:?}", kind);
+                    ""
+                }
                 None => "",
             }),
             // self.detail.as_deref().unwrap_or("")
@@ -77,14 +91,20 @@ pub struct Completion {
 }
 
 impl Completion {
+    pub const ID: &'static str = "completion";
+
     pub fn new(
         editor: &Editor,
-        items: Vec<CompletionItem>,
+        mut items: Vec<CompletionItem>,
         offset_encoding: helix_lsp::OffsetEncoding,
         start_offset: usize,
         trigger_offset: usize,
     ) -> Self {
-        let menu = Menu::new(items, move |editor: &mut Editor, item, event| {
+        // Sort completion items according to their preselect status (given by the LSP server)
+        items.sort_by_key(|item| !item.preselect.unwrap_or(false));
+
+        // Then create the menu
+        let menu = Menu::new(items, (), move |editor: &mut Editor, item, event| {
             fn item_to_transaction(
                 doc: &Document,
                 item: &CompletionItem,
@@ -92,13 +112,15 @@ impl Completion {
                 start_offset: usize,
                 trigger_offset: usize,
             ) -> Transaction {
-                if let Some(edit) = &item.text_edit {
+                let transaction = if let Some(edit) = &item.text_edit {
                     let edit = match edit {
                         lsp::CompletionTextEdit::Edit(edit) => edit.clone(),
                         lsp::CompletionTextEdit::InsertAndReplace(item) => {
-                            unimplemented!("completion: insert_and_replace {:?}", item)
+                            // TODO: support using "insert" instead of "replace" via user config
+                            lsp::TextEdit::new(item.replace, item.new_text.clone())
                         }
                     };
+
                     util::generate_transaction_from_edits(
                         doc.text(),
                         vec![edit],
@@ -114,16 +136,28 @@ impl Completion {
                         doc.text(),
                         vec![(trigger_offset, trigger_offset, Some(text.into()))].into_iter(),
                     )
-                }
+                };
+
+                transaction
+            }
+
+            fn completion_changes(transaction: &Transaction, trigger_offset: usize) -> Vec<Change> {
+                transaction
+                    .changes_iter()
+                    .filter(|(start, end, _)| (*start..=*end).contains(&trigger_offset))
+                    .collect()
             }
 
             let (view, doc) = current!(editor);
 
             // if more text was entered, remove it
-            doc.restore(view.id);
+            doc.restore(view);
 
             match event {
-                PromptEvent::Abort => {}
+                PromptEvent::Abort => {
+                    doc.restore(view);
+                    editor.last_completion = None;
+                }
                 PromptEvent::Update => {
                     // always present here
                     let item = item.unwrap();
@@ -138,8 +172,12 @@ impl Completion {
 
                     // initialize a savepoint
                     doc.savepoint();
+                    apply_transaction(&transaction, doc, view);
 
-                    doc.apply(&transaction, view.id);
+                    editor.last_completion = Some(CompleteAction {
+                        trigger_offset,
+                        changes: completion_changes(&transaction, trigger_offset),
+                    });
                 }
                 PromptEvent::Validate => {
                     // always present here
@@ -152,20 +190,30 @@ impl Completion {
                         start_offset,
                         trigger_offset,
                     );
-                    doc.apply(&transaction, view.id);
+
+                    apply_transaction(&transaction, doc, view);
+
+                    editor.last_completion = Some(CompleteAction {
+                        trigger_offset,
+                        changes: completion_changes(&transaction, trigger_offset),
+                    });
 
                     // apply additional edits, mostly used to auto import unqualified types
-                    let resolved_additional_text_edits = if item.additional_text_edits.is_some() {
-                        None
-                    } else {
-                        Completion::resolve_completion_item(doc, item.clone())
-                            .and_then(|item| item.additional_text_edits)
-                    };
-
-                    if let Some(additional_edits) = item
+                    let resolved_item = if item
                         .additional_text_edits
                         .as_ref()
-                        .or_else(|| resolved_additional_text_edits.as_ref())
+                        .map(|edits| !edits.is_empty())
+                        .unwrap_or(false)
+                    {
+                        None
+                    } else {
+                        Self::resolve_completion_item(doc, item.clone())
+                    };
+
+                    if let Some(additional_edits) = resolved_item
+                        .as_ref()
+                        .and_then(|item| item.additional_text_edits.as_ref())
+                        .or(item.additional_text_edits.as_ref())
                     {
                         if !additional_edits.is_empty() {
                             let transaction = util::generate_transaction_from_edits(
@@ -173,13 +221,13 @@ impl Completion {
                                 additional_edits.clone(),
                                 offset_encoding, // TODO: should probably transcode in Client
                             );
-                            doc.apply(&transaction, view.id);
+                            apply_transaction(&transaction, doc, view);
                         }
                     }
                 }
             };
         });
-        let popup = Popup::new("completion", menu);
+        let popup = Popup::new(Self::ID, menu).with_scrollbar(false);
         let mut completion = Self {
             popup,
             start_offset,
@@ -209,7 +257,7 @@ impl Completion {
         let future = language_server.resolve_completion_item(completion_item);
         let response = helix_lsp::block_on(future);
         match response {
-            Ok(completion_item) => Some(completion_item),
+            Ok(value) => serde_json::from_value(value).ok(),
             Err(err) => {
                 log::error!("execute LSP command: {}", err);
                 None
@@ -255,28 +303,65 @@ impl Completion {
     pub fn is_empty(&self) -> bool {
         self.popup.contents().is_empty()
     }
+
+    fn replace_item(&mut self, old_item: lsp::CompletionItem, new_item: lsp::CompletionItem) {
+        self.popup.contents_mut().replace_option(old_item, new_item);
+    }
+
+    /// Asynchronously requests that the currently selection completion item is
+    /// resolved through LSP `completionItem/resolve`.
+    pub fn ensure_item_resolved(&mut self, cx: &mut commands::Context) -> bool {
+        // > If computing full completion items is expensive, servers can additionally provide a
+        // > handler for the completion item resolve request. ...
+        // > A typical use case is for example: the `textDocument/completion` request doesn't fill
+        // > in the `documentation` property for returned completion items since it is expensive
+        // > to compute. When the item is selected in the user interface then a
+        // > 'completionItem/resolve' request is sent with the selected completion item as a parameter.
+        // > The returned completion item should have the documentation property filled in.
+        // https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_completion
+        let current_item = match self.popup.contents().selection() {
+            Some(item) if item.documentation.is_none() => item.clone(),
+            _ => return false,
+        };
+
+        let language_server = match doc!(cx.editor).language_server() {
+            Some(language_server) => language_server,
+            None => return false,
+        };
+
+        // This method should not block the compositor so we handle the response asynchronously.
+        let future = language_server.resolve_completion_item(current_item.clone());
+
+        cx.callback(
+            future,
+            move |_editor, compositor, response: Option<lsp::CompletionItem>| {
+                let resolved_item = match response {
+                    Some(item) => item,
+                    None => return,
+                };
+
+                if let Some(completion) = &mut compositor
+                    .find::<crate::ui::EditorView>()
+                    .unwrap()
+                    .completion
+                {
+                    completion.replace_item(current_item, resolved_item);
+                }
+            },
+        );
+
+        true
+    }
 }
 
-// need to:
-// - trigger on the right trigger char
-//   - detect previous open instance and recycle
-// - update after input, but AFTER the document has changed
-// - if no more matches, need to auto close
-//
-// missing bits:
-// - a more robust hook system: emit to a channel, process in main loop
-// - a way to find specific layers in compositor
-// - components register for hooks, then unregister when terminated
-// ... since completion is a special case, maybe just build it into doc/render?
-
 impl Component for Completion {
-    fn handle_event(&mut self, event: Event, cx: &mut Context) -> EventResult {
+    fn handle_event(&mut self, event: &Event, cx: &mut Context) -> EventResult {
         // let the Editor handle Esc instead
         if let Event::Key(KeyEvent {
             code: KeyCode::Esc, ..
         }) = event
         {
-            return EventResult::Ignored;
+            return EventResult::Ignored(None);
         }
         self.popup.handle_event(event, cx)
     }
@@ -296,14 +381,12 @@ impl Component for Completion {
             // option.documentation
 
             let (view, doc) = current!(cx.editor);
-            let language = doc
-                .language()
-                .and_then(|scope| scope.strip_prefix("source."))
-                .unwrap_or("");
+            let language = doc.language_name().unwrap_or("");
             let text = doc.text().slice(..);
             let cursor_pos = doc.selection(view.id).primary().cursor(text);
             let coords = helix_core::visual_coords_at_pos(text, cursor_pos, doc.tab_width());
             let cursor_pos = (coords.row - view.offset.row) as u16;
+
             let mut markdown_doc = match &option.documentation {
                 Some(lsp::Documentation::String(contents))
                 | Some(lsp::Documentation::MarkupContent(lsp::MarkupContent {

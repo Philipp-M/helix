@@ -6,12 +6,8 @@ use tui::widgets::{Block, Borders, Paragraph, Widget};
 
 impl Component for Info {
     fn render(&mut self, viewport: Rect, surface: &mut Surface, cx: &mut Context) {
-        let get_theme = |style, fallback| {
-            let theme = &cx.editor.theme;
-            theme.try_get(style).unwrap_or_else(|| theme.get(fallback))
-        };
-        let text_style = get_theme("ui.info.text", "ui.text");
-        let popup_style = text_style.patch(get_theme("ui.info", "ui.popup"));
+        let text_style = cx.editor.theme.get("ui.text.info");
+        let popup_style = cx.editor.theme.get("ui.popup.info");
 
         // Calculate the area of the terminal to modify. Because we want to
         // render at the bottom right, we use the viewport's width and height
@@ -31,10 +27,7 @@ impl Component for Info {
             .borders(Borders::ALL)
             .border_style(popup_style);
 
-        let margin = Margin {
-            vertical: 0,
-            horizontal: 1,
-        };
+        let margin = Margin::horizontal(1);
         let inner = block.inner(area).inner(&margin);
         block.render(area, surface);
 

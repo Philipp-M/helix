@@ -110,8 +110,8 @@ impl<'a> Increment for NumberIncrementor<'a> {
                 let (lower_count, upper_count): (usize, usize) =
                     old_text.chars().skip(2).fold((0, 0), |(lower, upper), c| {
                         (
-                            lower + c.is_ascii_lowercase().then(|| 1).unwrap_or(0),
-                            upper + c.is_ascii_uppercase().then(|| 1).unwrap_or(0),
+                            lower + usize::from(c.is_ascii_lowercase()),
+                            upper + usize::from(c.is_ascii_uppercase()),
                         )
                     });
                 if upper_count > lower_count {
@@ -371,13 +371,13 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }
 
     #[test]
-    fn test_increment_basic_hexadedimal_numbers() {
+    fn test_increment_basic_hexadecimal_numbers() {
         let tests = [
             ("0x0100", 1, "0x0101"),
             ("0x0100", -1, "0x00ff"),
@@ -398,7 +398,7 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }
@@ -426,7 +426,7 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }
@@ -472,7 +472,7 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }
@@ -500,7 +500,7 @@ mod test {
                     .unwrap()
                     .increment(amount)
                     .1,
-                expected.into()
+                Tendril::from(expected)
             );
         }
     }
