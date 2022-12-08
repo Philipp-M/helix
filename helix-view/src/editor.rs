@@ -180,6 +180,8 @@ pub struct Config {
     pub indent_guides: IndentGuidesConfig,
     /// Whether to color modes with different colors. Defaults to `false`.
     pub color_modes: bool,
+    /// Whether to render rainbow highlights. Defaults to `false`.
+    pub rainbow_brackets: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -633,6 +635,7 @@ impl Default for Config {
             bufferline: BufferLine::default(),
             indent_guides: IndentGuidesConfig::default(),
             color_modes: false,
+            rainbow_brackets: false,
         }
     }
 }
@@ -915,8 +918,7 @@ impl Editor {
             return;
         }
 
-        let scopes = theme.scopes();
-        self.syn_loader.set_scopes(scopes.to_vec());
+        self.syn_loader.set_scopes(theme.scopes().to_vec());
 
         match preview {
             ThemeAction::Preview => {
