@@ -13,11 +13,12 @@ use helix_core::{
     },
     movement::Direction,
     syntax::{self, HighlightEvent},
-    unicode::width::UnicodeWidthStr,
+    unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr},
     visual_coords_at_pos, LineEnding, Position, Range, Selection, Transaction,
 };
 use helix_view::{
     apply_transaction,
+    decorations::{TextAnnotation, TextAnnotationKind},
     document::{Mode, SCRATCH_BUFFER_NAME},
     editor::{CompleteAction, CursorShapeConfig},
     graphics::{Color, CursorKind, Modifier, Rect, Style},
@@ -418,6 +419,11 @@ impl EditorView {
         // It's slightly more efficient to produce a full RopeSlice from the Rope, then slice that a bunch
         // of times than it is to always call Rope::slice/get_slice (it will internally always hit RSEnum::Light).
         let text = doc.text().slice(..);
+        let last_line = std::cmp::min(
+            // Saturating subs to make it inclusive zero indexing.
+            (offset.row + viewport.height as usize).saturating_sub(1),
+            doc.text().len_lines().saturating_sub(1),
+        );
 
         let characters = &whitespace.characters;
 
@@ -478,6 +484,37 @@ impl EditorView {
             }
         };
 
+        // It's slightly more efficient to produce a full RopeSlice from the Rope, then slice that a bunch
+        // of times than it is to always call Rope::slice/get_slice (it will internally always hit RSEnum::Light).
+        let text = text.slice(..);
+        let out_of_bounds = |visual_x: u16| {
+            visual_x < offset.col as u16 || visual_x >= viewport.width + offset.col as u16
+        };
+
+        let render_annotation =
+            |annot: &TextAnnotation, line: u16, pos: u16, surface: &mut Surface| {
+                let mut visual_x = pos;
+                for grapheme in annot.text.graphemes(true) {
+                    if out_of_bounds(visual_x) {
+                        break;
+                    }
+                    surface.set_string(
+                        viewport.x + visual_x - offset.col as u16,
+                        viewport.y + line,
+                        grapheme,
+                        annot.style,
+                    );
+                    visual_x = visual_x.saturating_add(grapheme.width() as u16);
+                }
+            };
+
+        let text_annotations = doc
+            .text_annotations()
+            .iter()
+            .flat_map(|(_, annots)| annots)
+            .filter(|annot| (offset.row..last_line).contains(&annot.line))
+            .collect::<Vec<_>>();
+
         'outer: for event in highlights {
             match event {
                 HighlightEvent::HighlightStart(span) => {
@@ -516,11 +553,9 @@ impl EditorView {
                     use helix_core::graphemes::{grapheme_width, RopeGraphemes};
 
                     for grapheme in RopeGraphemes::new(text) {
-                        let out_of_bounds = offset.col > visual_x
-                            || visual_x >= viewport.width as usize + offset.col;
 
                         if LineEnding::from_rope_slice(&grapheme).is_some() {
-                            if !out_of_bounds {
+                            if !out_of_bounds(visual_x as u16) {
                                 // we still want to render an empty cell with the style
                                 surface.set_string(
                                     (viewport.x as usize + visual_x - offset.col) as u16,
@@ -528,9 +563,17 @@ impl EditorView {
                                     &newline,
                                     style.patch(whitespace_style),
                                 );
+                                visual_x += 1;
                             }
 
                             draw_indent_guides(last_line_indent_level, line, surface);
+
+                            if let Some(annot) = text_annotations
+                                .iter()
+                                .find(|t| t.kind.is_eol() && t.line == offset.row + line as usize)
+                            {
+                                render_annotation(annot, line, visual_x as u16, surface);
+                            }
 
                             visual_x = 0;
                             line += 1;
@@ -568,7 +611,7 @@ impl EditorView {
 
                             let cut_off_start = offset.col.saturating_sub(visual_x);
 
-                            if !out_of_bounds {
+                            if !out_of_bounds(visual_x as u16) {
                                 // if we're offscreen just keep going until we hit a new line
                                 surface.set_string(
                                     (viewport.x as usize + visual_x - offset.col) as u16,
@@ -608,6 +651,13 @@ impl EditorView {
                         }
                     }
                 }
+            }
+        }
+
+        for annot in &text_annotations {
+            if let TextAnnotationKind::Overlay(visual_x) = annot.kind {
+                let line = (annot.line - offset.row) as u16;
+                render_annotation(annot, line, visual_x as u16, surface);
             }
         }
     }

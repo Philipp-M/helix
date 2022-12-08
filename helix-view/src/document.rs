@@ -28,7 +28,11 @@ use helix_core::{
 };
 
 use crate::editor::RedrawHandle;
-use crate::{apply_transaction, DocumentId, Editor, View, ViewId};
+use crate::{
+    apply_transaction,
+    decorations::{TextAnnotation, TextAnnotationGroup},
+    DocumentId, Editor, View, ViewId,
+};
 
 /// 8kB of buffer space for encoding and decoding `Rope`s.
 const BUF_SIZE: usize = 8192;
@@ -139,6 +143,7 @@ pub struct Document {
     language_servers: Vec<Arc<helix_lsp::Client>>,
 
     diff_handle: Option<DiffHandle>,
+    text_annotations: HashMap<TextAnnotationGroup, Vec<TextAnnotation>>,
 }
 
 use std::{fmt, mem};
@@ -370,6 +375,7 @@ impl Document {
             language: None,
             changes,
             old_state,
+            text_annotations: HashMap::new(),
             diagnostics: Vec::new(),
             version: 0,
             history: Cell::new(History::default()),
@@ -1200,6 +1206,31 @@ impl Document {
             .map(|path| path.to_string_lossy().to_string().into())
             .unwrap_or_else(|| SCRATCH_BUFFER_NAME.into())
     }
+
+    pub fn text_annotations(&self) -> &HashMap<TextAnnotationGroup, Vec<TextAnnotation>> {
+        &self.text_annotations
+    }
+
+    pub fn push_text_annotations<I: Iterator<Item = TextAnnotation>>(
+        &mut self,
+        group: TextAnnotationGroup,
+        annots: I,
+    ) {
+        self.text_annotations
+            .entry(group)
+            .or_default()
+            .extend(annots);
+    }
+
+    pub fn clear_text_annotations(&mut self, group: TextAnnotationGroup) {
+        if let Some(annots) = self.text_annotations.get_mut(group) {
+            annots.clear()
+        }
+    }
+
+    // pub fn slice<R>(&self, range: R) -> RopeSlice where R: RangeBounds {
+    //     self.state.doc.slice
+    // }
 
     // transact(Fn) ?
 
