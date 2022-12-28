@@ -19,7 +19,6 @@
   (tuple_struct_pattern)
   (unit_type)
   (unit_expression)
-  (meta_arguments)
   (visibility_modifier)
   (parenthesized_expression)
   (token_repetition_pattern)
@@ -49,8 +48,7 @@
 ] @rainbow.scope
 
 ; attributes like `#[serde(rename_all = "kebab-case")]`
-(attr_item arguments: (token_tree) @rainbow.scope)
-
+(attribute arguments: (token_tree) @rainbow.scope)
 
 [
   "#"
