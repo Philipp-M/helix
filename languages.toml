@@ -1104,7 +1104,7 @@ language-servers = [ "docker-langserver" ]
 
 [[grammar]]
 name = "dockerfile"
-source = { git = "https://github.com/camdencheek/tree-sitter-dockerfile", rev = "7af32bc04a66ab196f5b9f92ac471f29372ae2ce" }
+source = { git = "https://github.com/camdencheek/tree-sitter-dockerfile", rev = "09e316dba307b869831e9399b11a83bbf0f2a24b" }
 
 [[language]]
 name = "git-commit"
