@@ -4230,32 +4230,34 @@ pub fn completion(cx: &mut Context) {
         Some(ItemSource::from_async_data(item_source, ()))
     };
 
-    let item_sources = doc
+    let item_sources: Vec<ItemSource<ui::CompletionItem>> = doc
         .language_servers_with_feature(LanguageServerFeature::Completion)
         .iter()
         .filter_map(create_completion_item_source)
         .collect();
 
-    OptionsManager::create_from_item_sources(
-        item_sources,
-        cx.editor,
-        cx.jobs,
-        move |editor, compositor, option_manager| {
-            if editor.mode != Mode::Insert {
-                // we're not in insert mode anymore
-                return;
-            }
+    if !item_sources.is_empty() {
+        OptionsManager::create_from_item_sources(
+            item_sources,
+            cx.editor,
+            cx.jobs,
+            move |editor, compositor, option_manager| {
+                if editor.mode != Mode::Insert {
+                    // we're not in insert mode anymore
+                    return;
+                }
 
-            let size = compositor.size();
-            let ui = compositor.find::<ui::EditorView>().unwrap();
-            // TODO doc id etc. everything that decouples this request from the current document/view etc. so that it's self contained
-            // Though it's not strictly necessary (as completion will be closed/canceled if escaping insert mode, so... nitpick)
-            ui.set_completion(editor, option_manager, start_offset, trigger_offset, size);
-        },
-        Some(Box::new(|editor: &mut Editor| {
-            editor.set_error("No completion available")
-        })),
-    );
+                let size = compositor.size();
+                let ui = compositor.find::<ui::EditorView>().unwrap();
+                // TODO doc id etc. everything that decouples this request from the current document/view etc. so that it's self contained
+                // Though it's not strictly necessary (as completion will be closed/canceled if escaping insert mode, so... nitpick)
+                ui.set_completion(editor, option_manager, start_offset, trigger_offset, size);
+            },
+            Some(Box::new(|editor: &mut Editor| {
+                editor.set_error("No completion available")
+            })),
+        );
+    }
 }
 
 // comments
