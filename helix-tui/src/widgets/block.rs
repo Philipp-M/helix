@@ -9,8 +9,8 @@ use helix_view::graphics::{Rect, Style};
 /// Border render type. Defaults to [`BorderType::Plain`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum BorderType {
-    #[default]
     Plain,
+    #[default]
     Rounded,
     Double,
     Thick,
@@ -42,7 +42,7 @@ impl BorderType {
 ///     .border_type(BorderType::Rounded)
 ///     .style(Style::default().bg(Color::Black));
 /// ```
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block<'a> {
     /// Optional title place on the upper left of the block
     title: Option<Spans<'a>>,
@@ -57,13 +57,25 @@ pub struct Block<'a> {
     style: Style,
 }
 
+impl<'a> Default for Block<'a> {
+    fn default() -> Block<'a> {
+        Block {
+            title: None,
+            borders: Default::default(),
+            border_style: Default::default(),
+            border_type: BorderType::Rounded,
+            style: Default::default(),
+        }
+    }
+}
+
 impl<'a> Block<'a> {
     pub const fn new() -> Self {
         Self {
             title: None,
             borders: Borders::empty(),
             border_style: Style::new(),
-            border_type: BorderType::Plain,
+            border_type: BorderType::Rounded,
             style: Style::new(),
         }
     }
