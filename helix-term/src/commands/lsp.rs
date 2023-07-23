@@ -390,9 +390,9 @@ pub fn symbol_picker(cx: &mut Context) {
         while let Some(mut lsp_items) = futures.try_next().await? {
             symbols.append(&mut lsp_items);
         }
-        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
             let picker = sym_picker(symbols, current_url);
-            compositor.push(Box::new(overlaid(picker)))
+            compositor.push(Box::new(overlaid(picker)), editor)
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -458,10 +458,10 @@ pub fn workspace_symbol_picker(cx: &mut Context) {
 
     cx.jobs.callback(async move {
         let symbols = initial_symbols.await?;
-        let call = move |_editor: &mut Editor, compositor: &mut Compositor| {
+        let call = move |editor: &mut Editor, compositor: &mut Compositor| {
             let picker = sym_picker(symbols, current_url);
             let dyn_picker = DynamicPicker::new(picker, Box::new(get_symbols));
-            compositor.push(Box::new(overlaid(dyn_picker)))
+            compositor.push(Box::new(overlaid(dyn_picker)), editor)
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -741,7 +741,7 @@ pub fn code_action(cx: &mut Context) {
             picker.move_down(); // pre-select the first item
 
             let popup = Popup::new("code-action", picker).with_scrollbar(false);
-            compositor.replace_or_push("code-action", popup);
+            compositor.replace_or_push("code-action", popup, editor);
         };
 
         Ok(Callback::EditorCompositor(Box::new(call)))
@@ -1029,7 +1029,7 @@ fn goto_impl(
                 jump_to_location(cx.editor, location, offset_encoding, action)
             })
             .with_preview(move |_editor, location| Some(location_to_file_location(location)));
-            compositor.push(Box::new(overlaid(picker)));
+            compositor.push(Box::new(overlaid(picker)), editor);
         }
     }
 }
@@ -1181,7 +1181,7 @@ pub fn hover(cx: &mut Context) {
 
                 let contents = ui::Markdown::new(contents, editor.syn_loader.clone());
                 let popup = Popup::new("hover", contents).auto_close(true);
-                compositor.replace_or_push("hover", popup);
+                compositor.replace_or_push("hover", popup, editor);
             }
         },
     );
@@ -1304,7 +1304,7 @@ pub fn rename_symbol(cx: &mut Context) {
 
                 let prompt = create_rename_prompt(editor, prefill, Some(ls_id));
 
-                compositor.push(prompt);
+                compositor.push(prompt, editor);
             },
         );
     } else {

@@ -261,7 +261,7 @@ pub fn show_signature_help(
         return;
     }
 
-    compositor.replace_or_push(SignatureHelp::ID, popup);
+    compositor.replace_or_push(SignatureHelp::ID, popup, editor);
 }
 
 fn signature_hepl_post_insert_char_hook(

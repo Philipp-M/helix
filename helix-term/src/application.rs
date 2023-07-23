@@ -157,7 +157,7 @@ impl Application {
             &config.keys
         }));
         let editor_view = Box::new(ui::EditorView::new(Keymaps::new(keys)));
-        compositor.push(editor_view);
+        compositor.push(editor_view, &mut editor);
 
         if args.load_tutor {
             let path = helix_loader::runtime_file(Path::new("tutor"));
@@ -170,7 +170,7 @@ impl Application {
                 helix_loader::set_current_working_dir(first.clone())?;
                 editor.new_file(Action::VerticalSplit);
                 let picker = ui::file_picker(".".into(), &config.load().editor);
-                compositor.push(Box::new(overlaid(picker)));
+                compositor.push(Box::new(overlaid(picker)), &mut editor);
             } else {
                 let nr_of_files = args.files.len();
                 for (i, (file, pos)) in args.files.into_iter().enumerate() {

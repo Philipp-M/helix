@@ -86,16 +86,16 @@ impl<'a> Context<'a> {
     /// Push a new component onto the compositor.
     pub fn push_layer(&mut self, component: Box<dyn Component>) {
         self.callback
-            .push(Box::new(|compositor: &mut Compositor, _| {
-                compositor.push(component)
+            .push(Box::new(|compositor: &mut Compositor, cx| {
+                compositor.push(component, cx.editor)
             }));
     }
 
     /// Call `replace_or_push` on the Compositor
     pub fn replace_or_push_layer<T: Component>(&mut self, id: &'static str, component: T) {
         self.callback
-            .push(Box::new(move |compositor: &mut Compositor, _| {
-                compositor.replace_or_push(id, component);
+            .push(Box::new(move |compositor: &mut Compositor, cx| {
+                compositor.replace_or_push(id, component, cx.editor);
             }));
     }
 
@@ -2262,7 +2262,7 @@ fn global_search(cx: &mut Context) {
                 });
 
                 cx.jobs.callback(async move {
-                    let call = move |_: &mut Editor, compositor: &mut Compositor| {
+                    let call = move |editor: &mut Editor, compositor: &mut Compositor| {
                         let picker = Picker::with_stream(
                             picker,
                             injector,
@@ -2302,7 +2302,7 @@ fn global_search(cx: &mut Context) {
                                 Some((path.clone().into(), Some((*line_num, *line_num))))
                             },
                         );
-                        compositor.push(Box::new(overlaid(picker)))
+                        compositor.push(Box::new(overlaid(picker)), editor)
                     };
                     Ok(Callback::EditorCompositor(Box::new(call)))
                 })
@@ -2907,7 +2907,7 @@ pub fn command_palette(cx: &mut Context) {
                     }
                 }
             });
-            compositor.push(Box::new(overlaid(picker)));
+            compositor.push(Box::new(overlaid(picker)), cx.editor);
         },
     ));
 }
@@ -2916,7 +2916,7 @@ fn last_picker(cx: &mut Context) {
     // TODO: last picker does not seem to work well with buffer_picker
     cx.callback.push(Box::new(|compositor, cx| {
         if let Some(picker) = compositor.last_picker.take() {
-            compositor.push(picker);
+            compositor.push(picker, cx.editor);
         } else {
             cx.editor.set_error("no last picker")
         }
