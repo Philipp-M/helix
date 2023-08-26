@@ -653,6 +653,9 @@ impl<T: Item + 'static> Picker<T> {
             row
         });
 
+        // TODO This is an aweful hack to get syntax highlighting working when it's opened
+        cx.editor.reset_idle_timer();
+
         let table = Table::new(options)
             .style(text_style)
             .highlight_style(selected)
