@@ -297,6 +297,8 @@ pub struct Config {
     pub workspace_lsp_roots: Vec<PathBuf>,
     /// Which line ending to choose for new documents. Defaults to `native`. i.e. `crlf` on Windows, otherwise `lf`.
     pub default_line_ending: LineEndingConfig,
+    /// Whether to automatically insert a trailing line-ending on write if missing. Defaults to `true`.
+    pub insert_final_newline: bool,
     /// Enables smart tab
     pub smart_tab: Option<SmartTabConfig>,
     /// Whether to render rainbow highlights. Defaults to `false`.
@@ -856,6 +858,7 @@ impl Default for Config {
             completion_replace: false,
             workspace_lsp_roots: Vec::new(),
             default_line_ending: LineEndingConfig::default(),
+            insert_final_newline: true,
             smart_tab: Some(SmartTabConfig::default()),
             rainbow_brackets: false,
         }
