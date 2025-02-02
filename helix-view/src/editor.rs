@@ -1026,7 +1026,7 @@ impl Default for Config {
             end_of_line_diagnostics: DiagnosticFilter::Disable,
             clipboard_provider: ClipboardProvider::default(),
             editor_config: true,
-            rainbow_brackets: false,
+            rainbow_brackets: true,
         }
     }
 }
