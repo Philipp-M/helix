@@ -11,12 +11,14 @@ use crate::lsp::{
     DidChangeWorkspaceFoldersParams, OneOf, PositionEncodingKind, SignatureHelp, Url,
     WorkspaceFolder, WorkspaceFoldersChangeEvent,
 };
+use futures_util::FutureExt;
 use helix_core::{
     find_workspace,
     syntax::config::{LanguageServerFeature, RootMarkers},
     ChangeSet, Rope,
 };
 use helix_loader::VERSION_AND_GIT_HASH;
+use helix_lsp_types::ExecuteCommandParams;
 use helix_stdx::path;
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -1386,11 +1388,47 @@ impl Client {
             _ => return None,
         }
 
-        Some(self.goto_request::<lsp::request::GotoDefinition>(
-            text_document,
-            position,
-            work_done_token,
-        ))
+        if text_document.uri.as_str().ends_with(".ts")
+            || text_document.uri.as_str().ends_with(".js")
+            || text_document.uri.as_str().ends_with(".tsx")
+            || text_document.uri.as_str().ends_with(".jsx")
+        {
+            Some(
+                self.call::<lsp::request::ExecuteCommand>(ExecuteCommandParams {
+                    command: "_typescript.goToSourceDefinition".to_string(),
+                    arguments: vec![
+                        serde_json::json!(text_document.uri),
+                        serde_json::json!(position),
+                    ],
+                    work_done_progress_params: Default::default(),
+                })
+                // beautiful, I know...
+                .map(|r| r.map(|r| r.map(|r| serde_json::from_value(r).unwrap())))
+                // .then(async move |e| {
+                //     let res = e?;
+                //     match res {
+                //         Value::Array(res) if res.is_empty() => Ok(self
+                //             .goto_request::<lsp::request::GotoDefinition>(
+                //                 text_document,
+                //                 position,
+                //                 work_done_token,
+                //             )
+                //             .await?),
+                //         _ => Ok(res),
+                //     }
+                // })
+                .boxed(),
+            )
+        } else {
+            Some(
+                self.goto_request::<lsp::request::GotoDefinition>(
+                    text_document,
+                    position,
+                    work_done_token,
+                )
+                .boxed(),
+            )
+        }
     }
 
     pub fn goto_declaration(
