@@ -203,9 +203,9 @@ pub struct InlineBlameConfig {
 impl Default for InlineBlameConfig {
     fn default() -> Self {
         Self {
-            show: InlineBlameShow::Never,
+            show: InlineBlameShow::CursorLine,
             format: "{author}, {time-ago} • {title} • {commit}".to_owned(),
-            auto_fetch: false,
+            auto_fetch: true,
         }
     }
 }
